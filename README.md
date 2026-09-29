@@ -1,5 +1,10 @@
 # DashCommerce
 
+[![npm](https://img.shields.io/npm/v/@dashcommerce/core?label=%40dashcommerce%2Fcore)](https://www.npmjs.com/package/@dashcommerce/core)
+[![npm downloads](https://img.shields.io/npm/dw/@dashcommerce/core)](https://www.npmjs.com/package/@dashcommerce/core)
+[![GitHub stars](https://img.shields.io/github/stars/emdashCommerce/dashcommerce?style=social)](https://github.com/emdashCommerce/dashcommerce)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 **WooCommerce-class commerce for [EmDash CMS](https://github.com/emdash-cms/emdash)** — the Astro-native, Cloudflare-powered WordPress successor.
 
 Full-featured ecommerce in one plugin: products, cart, checkout, orders, subscriptions, multi-vendor marketplace, and more. Runs on Cloudflare Workers or Node.js (Railway, Render, etc.). Typed end-to-end. Sandbox-safe. MIT licensed.
@@ -18,14 +23,20 @@ Scaffolds a complete storefront with EmDash + DashCommerce, demo products, and S
 
 ## Current Release
 
-**v0.2.0** on npm — compatible with **EmDash 0.37+**
+**v0.2.0** on npm — peer range **EmDash `>=0.37.0 <0.38.0`** (EmDash 0.38 day-one compat is ready in [PR #28](https://github.com/emdashCommerce/dashcommerce/pull/28); merge ships as `0.2.1`).
 
 | Package | Version | EmDash Compatibility |
 |---|---|---|
-| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.0 | EmDash ^0.37.0 |
-| `@dashcommerce/create` | 0.2.0 | Scaffolds EmDash 0.37+ projects |
+| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.0 | EmDash 0.37.x |
+| `@dashcommerce/create` | 0.2.0 | Scaffolds EmDash 0.37.x projects |
+
+Stay on **0.1.x** if you need EmDash 0.28.x — that line remains on npm and is not bricked by 0.2.x.
 
 The v1.0 feature roadmap is code-complete. SemVer: `0.x` may include minor breaking changes until **1.0.0** — see [CHANGELOG.md](./CHANGELOG.md).
+
+### Discoverability (next bet)
+
+EmDash now ships an experimental [plugin registry](https://docs.emdashcms.com/plugins/registry/) (`registry.emdashcms.com`). Listing DashCommerce there — once Atmosphere publisher credentials are ready — is the highest-leverage organic install path after npm. Tracked as a follow-up after EmDash 0.38 peer ship.
 
 ## Why DashCommerce
 
