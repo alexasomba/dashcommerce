@@ -563,7 +563,11 @@ async function handleChargeRefunded(
 }
 
 async function readRawBody(req: Request): Promise<string> {
-	return req.text();
+	// EmDash guards ctx.request.text()/json() after parsing into ctx.input.
+	// Our emdash patch parses via request.clone().json(), so the original
+	// body stream is still readable through an unguarded clone — required
+	// for Stripe signature verification over the exact raw payload.
+	return req.clone().text();
 }
 
 export const webhookRoutes = {
