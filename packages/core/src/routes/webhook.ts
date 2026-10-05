@@ -7,6 +7,7 @@
  * on `event.type`:
  *
  *   payment_intent.succeeded  → createOrderFromPaymentIntent
+ *   checkout.session.completed / async_payment_succeeded → hosted order (paid only)
  *   payment_intent.payment_failed / canceled → release stock lock
  *   charge.refunded           → recordRefundFromWebhook (idempotent dedup)
  *   refund.updated            → status update on refund row
@@ -358,6 +359,24 @@ async function handleCheckoutSessionCompleted(
 		);
 	}
 
+	// Only create an order once Stripe reports the session as paid.
+	// Async methods (bank debit, etc.) complete later via
+	// checkout.session.async_payment_succeeded — ignore unpaid completed events.
+	if (session.payment_status !== "paid") {
+		ctx.log.info("checkout.session skipped — not paid yet", {
+			sessionId: session.id,
+			paymentStatus: session.payment_status,
+		});
+		return new Response(
+			JSON.stringify({
+				received: true,
+				deferred: true,
+				reason: `payment_status=${session.payment_status ?? "unknown"}`,
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	}
+
 	if (!session.payment_intent) {
 		ctx.log.warn("checkout.session.completed has no payment_intent", {
 			sessionId: session.id,
@@ -626,6 +645,7 @@ export const webhookRoutes = {
 							event.data.object as StripePaymentIntent,
 						);
 					case "checkout.session.completed":
+					case "checkout.session.async_payment_succeeded":
 						return await handleCheckoutSessionCompleted(
 							ctx,
 							event.data.object as StripeCheckoutSession,

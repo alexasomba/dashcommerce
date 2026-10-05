@@ -91,6 +91,12 @@ export interface CreateCheckoutSessionInput {
 	subscriptionMetadata?: Record<string, string>;
 	/** Trial period for `mode=subscription` sessions. */
 	subscriptionTrialPeriodDays?: number;
+	/**
+	 * Stripe Coupon ids to apply on the session. Used for merchant-engine
+	 * discounts (via createOneTimeCoupon) so hosted Checkout totals match
+	 * the cart after coupons. Mutually exclusive with allowPromotionCodes.
+	 */
+	discounts?: Array<{ coupon: string }>;
 }
 
 export interface StripeCheckoutSession {
@@ -213,6 +219,10 @@ export async function createCheckoutSession(
 		}
 	}
 
+	(input.discounts ?? []).forEach((d, i) => {
+		params[`discounts[${i}][coupon]`] = d.coupon;
+	});
+
 	// Subscription plumbing — only valid for mode=subscription.
 	if (input.mode === "subscription") {
 		if (input.subscriptionMetadata) {
@@ -308,6 +318,54 @@ export async function createBillingPortalSession(
 	return call<BillingPortalSession>(ctx, {
 		method: "POST",
 		path: "/billing_portal/sessions",
+		params: params as Record<string, never>,
+		idempotencyKey,
+		client,
+	});
+}
+
+// =============================================================================
+// One-time Coupons (merchant-engine discounts on hosted Checkout)
+// =============================================================================
+
+export interface CreateOneTimeCouponInput {
+	/** Integer minor units to subtract from the session total. */
+	amountOff: number;
+	/** Lowercase ISO-4217. */
+	currency: string;
+	name?: string;
+}
+
+export interface StripeCoupon {
+	id: string;
+	object: "coupon";
+	amount_off?: number;
+	percent_off?: number;
+	currency?: string;
+	duration: string;
+	valid: boolean;
+}
+
+/**
+ * Create a single-use Stripe Coupon for the current Checkout Session.
+ * Duration is always "once" — the coupon exists only to make Stripe's
+ * hosted total match our cart.discountTotal.
+ */
+export async function createOneTimeCoupon(
+	ctx: PluginContext,
+	input: CreateOneTimeCouponInput,
+	client: StripeClientOptions,
+	idempotencyKey: string,
+): Promise<StripeCoupon> {
+	const params: Record<string, unknown> = {
+		amount_off: input.amountOff,
+		currency: input.currency.toLowerCase(),
+		duration: "once",
+	};
+	if (input.name) params.name = input.name;
+	return call<StripeCoupon>(ctx, {
+		method: "POST",
+		path: "/coupons",
 		params: params as Record<string, never>,
 		idempotencyKey,
 		client,
