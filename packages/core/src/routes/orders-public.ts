@@ -22,6 +22,7 @@
 
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
 import type { Order, OrderItem } from "../types";
+import { orderItemFromStorage } from "../orders/order-item-storage";
 import { draftKey } from "./checkout";
 
 type OrdersStore = StorageCollection<Order>;
@@ -84,7 +85,7 @@ export const ordersPublicRoutes = {
 						where: { orderId: order.id },
 						limit: 200,
 					})
-				).items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
+				).items.map((r) => orderItemFromStorage(r.id, r.data as OrderItem));
 				return json({ status: "ready", order, items });
 			}
 

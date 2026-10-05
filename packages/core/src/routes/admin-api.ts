@@ -1,3 +1,4 @@
+import { orderItemFromStorage } from "../orders/order-item-storage";
 /**
  * Admin backend API — every page + widget in `admin/entry.tsx` calls
  * routes declared here via `usePluginAPI()` (which auto-prefixes the
@@ -229,7 +230,7 @@ async function getOrderDetail(
 			where: { orderId },
 			limit: 200,
 		})
-	).items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
+	).items.map((r) => orderItemFromStorage(r.id, r.data as OrderItem));
 	const refunds = (
 		await storeOf<Refund>(ctx, "refunds").query({
 			where: { orderId },
@@ -341,7 +342,7 @@ async function loadOrderItems(
 		where: { orderId },
 		limit: 200,
 	});
-	return res.items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
+	return res.items.map((r) => orderItemFromStorage(r.id, r.data as OrderItem));
 }
 
 async function queryCustomers(

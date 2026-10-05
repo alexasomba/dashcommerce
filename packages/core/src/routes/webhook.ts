@@ -7,6 +7,7 @@
  * on `event.type`:
  *
  *   payment_intent.succeeded  → createOrderFromPaymentIntent
+ *   checkout.session.completed / async_payment_succeeded → hosted order (paid only)
  *   payment_intent.payment_failed / canceled → release stock lock
  *   charge.refunded           → recordRefundFromWebhook (idempotent dedup)
  *   refund.updated            → status update on refund row
@@ -358,6 +359,24 @@ async function handleCheckoutSessionCompleted(
 		);
 	}
 
+	// Only create an order once Stripe reports the session as paid.
+	// Async methods (bank debit, etc.) complete later via
+	// checkout.session.async_payment_succeeded — ignore unpaid completed events.
+	if (session.payment_status !== "paid") {
+		ctx.log.info("checkout.session skipped — not paid yet", {
+			sessionId: session.id,
+			paymentStatus: session.payment_status,
+		});
+		return new Response(
+			JSON.stringify({
+				received: true,
+				deferred: true,
+				reason: `payment_status=${session.payment_status ?? "unknown"}`,
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	}
+
 	if (!session.payment_intent) {
 		ctx.log.warn("checkout.session.completed has no payment_intent", {
 			sessionId: session.id,
@@ -447,11 +466,37 @@ async function handleCheckoutSessionCompleted(
 	}
 	const pi = await retrievePaymentIntent(ctx, session.payment_intent, client);
 
-	const { order, duplicate } = await createOrderFromPaymentIntent(ctx, {
-		paymentIntent: pi,
-		cartSnapshot: cart,
-		orderDraftId,
-	});
+	let order;
+	let duplicate = false;
+	try {
+		({ order, duplicate } = await createOrderFromPaymentIntent(ctx, {
+			paymentIntent: pi,
+			cartSnapshot: cart,
+			orderDraftId,
+		}));
+	} catch (err) {
+		// If a concurrent delivery (or a partial prior attempt) already
+		// persisted the order for this PI, treat as idempotent success
+		// instead of 500 — Stripe will otherwise keep retrying.
+		const recovered = await findOrderByPaymentIntent(ctx, pi.id);
+		if (recovered) {
+			ctx.log.warn("checkout.session.completed recovered existing order after error", {
+				orderId: recovered.id,
+				paymentIntentId: pi.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return new Response(
+				JSON.stringify({
+					received: true,
+					duplicate: true,
+					recovered: true,
+					orderId: recovered.id,
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		throw err;
+	}
 
 	if (!duplicate) {
 		await ctx.kv.delete(draftKey(orderDraftId));
@@ -544,7 +589,11 @@ async function handleChargeRefunded(
 }
 
 async function readRawBody(req: Request): Promise<string> {
-	return req.text();
+	// EmDash guards ctx.request.text()/json() after parsing into ctx.input.
+	// Our emdash patch parses via request.clone().json(), so the original
+	// body stream is still readable through an unguarded clone — required
+	// for Stripe signature verification over the exact raw payload.
+	return req.clone().text();
 }
 
 export const webhookRoutes = {
@@ -626,6 +675,7 @@ export const webhookRoutes = {
 							event.data.object as StripePaymentIntent,
 						);
 					case "checkout.session.completed":
+					case "checkout.session.async_payment_succeeded":
 						return await handleCheckoutSessionCompleted(
 							ctx,
 							event.data.object as StripeCheckoutSession,

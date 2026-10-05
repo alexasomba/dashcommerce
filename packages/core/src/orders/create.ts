@@ -33,10 +33,12 @@ import type {
 	OrderItem,
 	Refund,
 } from "../types";
-import { zero } from "../money";
+import { money, zero } from "../money";
 import { decrementForOrderItem } from "../inventory/decrement";
 import { issueGrantsForOrder } from "../downloads/grant";
 import { sendOrderReceipt } from "./receipt";
+import { reconcilePaymentAmount } from "./reconcile";
+import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
 import type { StripePaymentIntent } from "../stripe/payment-intents";
 
 type OrdersStore = StorageCollection<Order>;
@@ -284,6 +286,23 @@ export async function createOrderFromPaymentIntent(
 		return { order: existing, duplicate: true };
 	}
 
+	if (pi.status !== "succeeded") {
+		throw new Error(
+			`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`,
+		);
+	}
+
+	const reconcile = reconcilePaymentAmount(cart.total.amount, pi.amount_received);
+	const amountMismatch = !reconcile.ok;
+	if (amountMismatch) {
+		ctx.log.error("Payment amount mismatch — order will be placed on-hold", {
+			paymentIntentId: pi.id,
+			expected: reconcile.expected,
+			received: reconcile.received,
+			delta: reconcile.delta,
+		});
+	}
+
 	if (!cart.billingAddress || !cart.shippingAddress) {
 		throw new Error(
 			"Cart snapshot is missing billing or shipping address — cannot create order.",
@@ -335,10 +354,13 @@ export async function createOrderFromPaymentIntent(
 		return lineItem;
 	});
 
+	const paidMinor =
+		typeof pi.amount_received === "number" ? pi.amount_received : cart.total.amount;
+
 	const order: Order = {
 		id: orderId,
 		orderNumber,
-		status: "processing",
+		status: amountMismatch ? "on-hold" : "processing",
 		paymentStatus: "paid",
 		customerId: customer.id,
 		customerEmail: customer.email,
@@ -352,7 +374,7 @@ export async function createOrderFromPaymentIntent(
 		shippingTotal: cart.shippingTotal,
 		taxTotal: cart.taxTotal,
 		total: cart.total,
-		paidTotal: cart.total,
+		paidTotal: money(cart.currency, paidMinor),
 		refundedTotal: zero(cart.currency),
 		taxLines: cart.taxLines,
 		couponCodes: cart.coupons.map((c) => c.code),
@@ -361,7 +383,16 @@ export async function createOrderFromPaymentIntent(
 		...(pi.latest_charge ? { stripeChargeId: pi.latest_charge } : {}),
 		paymentMethodType: pi.payment_method_types?.[0],
 		...(cart.notes ? { customerNote: cart.notes } : {}),
-		metadata: { orderDraftId },
+		metadata: {
+			orderDraftId,
+			...(amountMismatch
+				? {
+						paymentAmountMismatch: true,
+						expectedAmount: reconcile.expected,
+						receivedAmount: reconcile.received,
+					}
+				: {}),
+		},
 		createdAt: now,
 		updatedAt: now,
 		paidAt: now,
@@ -373,7 +404,11 @@ export async function createOrderFromPaymentIntent(
 	// the number that actually landed on disk.
 	Object.assign(order, persistedOrder);
 	await orderItemsStore(ctx).putMany(
-		items.map((it) => ({ id: it.id, data: it })),
+		items.map((it) => ({
+			id: it.id,
+			// Cast: storage row intentionally omits uniquely-indexed `sku`.
+			data: orderItemToStorage(it) as unknown as OrderItem,
+		})),
 	);
 
 	// (5) Decrement stock + write ledger per line.
@@ -429,18 +464,28 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	// (8) Digital download grants (no-op when no digital items present).
-	try {
-		const issued = await issueGrantsForOrder(ctx, order, items);
-		if (issued.length > 0) {
-			ctx.log.info("Issued download grants", {
+	// Withhold grants when amount_received does not match cart total —
+	// operator must review the on-hold order before releasing downloads.
+	if (!amountMismatch) {
+		try {
+			const issued = await issueGrantsForOrder(ctx, order, items);
+			if (issued.length > 0) {
+				ctx.log.info("Issued download grants", {
+					orderId: order.id,
+					count: issued.length,
+				});
+			}
+		} catch (err) {
+			ctx.log.warn("Download grant issuance failed", {
 				orderId: order.id,
-				count: issued.length,
+				error: err instanceof Error ? err.message : String(err),
 			});
 		}
-	} catch (err) {
-		ctx.log.warn("Download grant issuance failed", {
+	} else {
+		ctx.log.warn("Withholding download grants due to payment amount mismatch", {
 			orderId: order.id,
-			error: err instanceof Error ? err.message : String(err),
+			expected: reconcile.expected,
+			received: reconcile.received,
 		});
 	}
 
@@ -461,7 +506,9 @@ export async function loadOrderItems(
 	orderId: string,
 ): Promise<OrderItem[]> {
 	const result = await orderItemsStore(ctx).query({ where: { orderId }, limit: 200 });
-	return result.items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
+	return result.items.map((r) =>
+		orderItemFromStorage(r.id, r.data as OrderItem),
+	);
 }
 
 export { findOrderByPaymentIntent };

@@ -34,6 +34,7 @@ import { getCart, getOrCreate, save, switchCurrency } from "../cart/store";
 import { recalculate, type PricingPolicy } from "../cart/calculate";
 import { verifyRestoreToken } from "../abandoned-cart/recover";
 import { resolveDiscount, validateCoupon } from "../coupons/validate";
+import { refreshAppliedCoupons } from "../coupons/refresh";
 import { calculateRates } from "../shipping/calculate";
 import { pickZone } from "../shipping/calculate";
 import type {
@@ -46,6 +47,8 @@ import type {
 } from "../types";
 import { resolvePrice } from "../products/pricing";
 import { normalizeProductFields } from "../products/normalize";
+import { getVariant } from "../products/variants";
+import { isVariantOfProduct } from "../products/variant-guard";
 
 // Cart routes must return HTTP 4xx on failure — returning a plain
 // `{ error }` object gets serialized as `{ status: 200, body: { error } }`
@@ -195,7 +198,28 @@ export const cartRoutes = {
 			const fields = normalizeProductFields(
 				product.data as Record<string, unknown>,
 			);
-			const priced = resolvePrice({ product: fields, currency: cart.currency });
+
+			// Resolve product id to the content ULID so variant.productId checks
+			// are stable even when the client passed a slug.
+			const productId = product.id;
+
+			let variant = null;
+			if (body.variantId) {
+				variant = await getVariant(ctx, body.variantId);
+				if (!isVariantOfProduct(variant, productId)) {
+					return errorResponse(
+						"Variant does not belong to this product or is inactive",
+						400,
+						setCookie,
+					);
+				}
+			}
+
+			const priced = resolvePrice({
+				product: fields,
+				variant,
+				currency: cart.currency,
+			});
 			if (!priced) {
 				const available = Object.keys(fields.prices ?? {});
 				const enabled =
@@ -221,7 +245,7 @@ export const cartRoutes = {
 
 			// Merge with existing line if same product+variant combination
 			const existing = cart.items.find(
-				(i) => i.productId === body.productId && i.variantId === body.variantId,
+				(i) => i.productId === productId && i.variantId === body.variantId,
 			);
 			let items: CartLineItem[];
 			if (existing) {
@@ -241,7 +265,7 @@ export const cartRoutes = {
 				const lineId = randomId();
 				const newItem: CartLineItem = {
 					lineId,
-					productId: body.productId,
+					productId,
 					...(body.variantId ? { variantId: body.variantId } : {}),
 					quantity: qty,
 					unitPrice: priced.unit,
@@ -263,7 +287,9 @@ export const cartRoutes = {
 				items = [...cart.items, newItem];
 			}
 
-			const updated = recalculate({ ...cart, items }, await readPricingPolicy(ctx));
+			const withItems = { ...cart, items };
+			const refreshed = await refreshAppliedCoupons(ctx, withItems);
+			const updated = recalculate(refreshed, await readPricingPolicy(ctx));
 			const saved = await save(ctx, updated);
 			return jsonResponse({ cart: saved }, withSessionCookie(setCookie));
 		},
@@ -441,7 +467,9 @@ export const cartRoutes = {
 				return errorResponse("Cart line not found", 404, setCookie);
 			}
 
-			const updated = recalculate({ ...cart, items }, await readPricingPolicy(ctx));
+			const withItems = { ...cart, items };
+			const refreshed = await refreshAppliedCoupons(ctx, withItems);
+			const updated = recalculate(refreshed, await readPricingPolicy(ctx));
 			const saved = await save(ctx, updated);
 			return jsonResponse({ cart: saved }, withSessionCookie(setCookie));
 		},

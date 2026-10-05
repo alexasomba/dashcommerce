@@ -23,9 +23,13 @@ import { createLock, newLock, sumActiveLocksForProduct } from "../cart/lock";
 import { money, zero } from "../money";
 import { resolvePrice } from "../products/pricing";
 import { getVariant } from "../products/variants";
+import { isVariantOfProduct } from "../products/variant-guard";
+import { refreshAppliedCoupons } from "../coupons/refresh";
+import { requoteShipping } from "../shipping/requote";
 import { createPaymentIntent } from "../stripe/payment-intents";
 import {
 	createCheckoutSession,
+	createOneTimeCoupon,
 	type CheckoutLineItem,
 	type CheckoutShippingOption,
 } from "../stripe/checkout-sessions";
@@ -103,6 +107,16 @@ async function repriceAndCheckStock(
 			record.data as Record<string, unknown>,
 		);
 		const variant = line.variantId ? await getVariant(ctx, line.variantId) : null;
+		if (line.variantId) {
+			if (!isVariantOfProduct(variant, record.id)) {
+				errors.push({
+					lineId: line.lineId,
+					productId: line.productId,
+					reason: "invalid variant for product",
+				});
+				continue;
+			}
+		}
 		const priced = resolvePrice({ product: fields, variant, currency: cart.currency });
 		if (!priced) {
 			errors.push({
@@ -166,6 +180,35 @@ async function repriceAndCheckStock(
 	return { items: out, errors, stockEntries };
 }
 
+
+function totalsChanged(before: CartState, after: CartState): boolean {
+	return (
+		before.total.amount !== after.total.amount ||
+		before.subtotal.amount !== after.subtotal.amount ||
+		before.discountTotal.amount !== after.discountTotal.amount ||
+		before.shippingTotal.amount !== after.shippingTotal.amount ||
+		before.taxTotal.amount !== after.taxTotal.amount
+	);
+}
+
+/**
+ * After server-side reprice + stock check: refresh coupons, re-quote
+ * shipping, and recalculate. Returns the corrected cart. Callers that
+ * observe a totals drift vs the pre-check cart should 409 with the
+ * corrected cart so the client can confirm before charging.
+ */
+async function finalizeCheckoutCart(
+	ctx: PluginContext,
+	cart: CartState,
+	repricedItems: CartLineItem[],
+	policy: PricingPolicy,
+): Promise<CartState> {
+	let next: CartState = { ...cart, items: repricedItems };
+	next = await refreshAppliedCoupons(ctx, next);
+	next = await requoteShipping(ctx, next);
+	return recalculate(next, policy);
+}
+
 export const checkoutRoutes = {
 	"checkout/create-intent": {
 		public: true,
@@ -222,7 +265,18 @@ export const checkoutRoutes = {
 			}
 
 			const policy = await readPricingPolicy(ctx);
-			const recalculated = recalculate({ ...withContact, items }, policy);
+			const recalculated = await finalizeCheckoutCart(ctx, withContact, items, policy);
+			if (totalsChanged(withContact, recalculated)) {
+				await save(ctx, recalculated);
+				return new Response(
+					JSON.stringify({
+						error: "Cart totals changed — review and retry checkout",
+						code: "cart_totals_changed",
+						cart: recalculated,
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
 			if (recalculated.total.amount <= 0) {
 				return new Response(JSON.stringify({ error: "Order total must be positive" }), {
 					status: 400,
@@ -420,7 +474,18 @@ export const checkoutRoutes = {
 			}
 
 			const policy = await readPricingPolicy(ctx);
-			const recalculated = recalculate({ ...withContact, items }, policy);
+			const recalculated = await finalizeCheckoutCart(ctx, withContact, items, policy);
+			if (totalsChanged(withContact, recalculated)) {
+				await save(ctx, recalculated);
+				return new Response(
+					JSON.stringify({
+						error: "Cart totals changed — review and retry checkout",
+						code: "cart_totals_changed",
+						cart: recalculated,
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
 			if (recalculated.total.amount <= 0) {
 				return new Response(JSON.stringify({ error: "Order total must be positive" }), {
 					status: 400,
@@ -470,13 +535,12 @@ export const checkoutRoutes = {
 			// store shape.
 			const stripeTaxEnabled = policy.taxMode === "stripe_tax";
 
-			// Build Checkout Session line items from the re-priced cart. We
-			// deliberately do NOT push tax/discount/shipping as line items
-			// here — taxes come from `automatic_tax` (when enabled), and
-			// shipping is passed as `shipping_options`. Discounts that the
-			// merchant's coupon engine already applied are baked into the
-			// line `unit_amount` so the Stripe total matches `cart.total`
-			// exactly.
+			// Build Checkout Session line items from the re-priced cart.
+			// Product lines use unit prices (pre-discount). Shipping is passed
+			// as `shipping_options`. Flat/table tax is appended as its own
+			// line item (stripe_tax uses automatic_tax instead). Merchant
+			// coupon discounts are applied via a one-time Stripe Coupon so
+			// the hosted total matches cart.total.
 			const lineItems: CheckoutLineItem[] = recalculated.items.map((line) => ({
 				amount: line.unitPrice.amount,
 				currency: line.unitPrice.currency.toLowerCase(),
@@ -497,6 +561,19 @@ export const checkoutRoutes = {
 				...(stripeTaxEnabled ? { taxBehavior: "exclusive" as const } : {}),
 			}));
 
+			if (!stripeTaxEnabled && recalculated.taxTotal.amount > 0) {
+				const taxLabel =
+					recalculated.taxLines.map((l) => l.label).filter(Boolean).join(", ") ||
+					"Tax";
+				lineItems.push({
+					amount: recalculated.taxTotal.amount,
+					currency: recalculated.currency.toLowerCase(),
+					name: taxLabel,
+					quantity: 1,
+					metadata: { kind: "tax" },
+				});
+			}
+
 			const shippingOptions: CheckoutShippingOption[] = recalculated.shippingMethod
 				? [
 						{
@@ -507,12 +584,6 @@ export const checkoutRoutes = {
 						},
 					]
 				: [];
-
-		// Discount as a negative line item — Stripe rejects negative
-		// `unit_amount` on Checkout, so we fold discounts into the
-		// unit price above. If a merchant wants the discount broken
-		// out visually on the Stripe page, they can use Stripe Coupons
-		// (a Pass 2 item).
 
 		// Use getPublicSiteUrl() to ensure we never use localhost or stale
 		// database options (emdash:site_url) for Stripe redirect URLs.
@@ -595,6 +666,23 @@ export const checkoutRoutes = {
 					}
 				: undefined;
 
+			let stripeDiscountCouponId: string | undefined;
+			if (recalculated.discountTotal.amount > 0 && !isSubscriptionCart) {
+				const couponName =
+					recalculated.coupons.map((c) => c.code).join("+") || "Cart discount";
+				const stripeCoupon = await createOneTimeCoupon(
+					ctx,
+					{
+						amountOff: recalculated.discountTotal.amount,
+						currency: recalculated.currency,
+						name: couponName,
+					},
+					client,
+					`coupon:${orderDraftId}`,
+				);
+				stripeDiscountCouponId = stripeCoupon.id;
+			}
+
 			const session = await createCheckoutSession(
 				ctx,
 				{
@@ -602,6 +690,9 @@ export const checkoutRoutes = {
 					successUrl,
 					cancelUrl,
 					lineItems,
+					...(stripeDiscountCouponId
+						? { discounts: [{ coupon: stripeDiscountCouponId }] }
+						: {}),
 					...(recalculated.customerEmail
 						? { customerEmail: recalculated.customerEmail }
 						: {}),
