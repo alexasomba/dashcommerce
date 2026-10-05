@@ -466,11 +466,37 @@ async function handleCheckoutSessionCompleted(
 	}
 	const pi = await retrievePaymentIntent(ctx, session.payment_intent, client);
 
-	const { order, duplicate } = await createOrderFromPaymentIntent(ctx, {
-		paymentIntent: pi,
-		cartSnapshot: cart,
-		orderDraftId,
-	});
+	let order;
+	let duplicate = false;
+	try {
+		({ order, duplicate } = await createOrderFromPaymentIntent(ctx, {
+			paymentIntent: pi,
+			cartSnapshot: cart,
+			orderDraftId,
+		}));
+	} catch (err) {
+		// If a concurrent delivery (or a partial prior attempt) already
+		// persisted the order for this PI, treat as idempotent success
+		// instead of 500 — Stripe will otherwise keep retrying.
+		const recovered = await findOrderByPaymentIntent(ctx, pi.id);
+		if (recovered) {
+			ctx.log.warn("checkout.session.completed recovered existing order after error", {
+				orderId: recovered.id,
+				paymentIntentId: pi.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return new Response(
+				JSON.stringify({
+					received: true,
+					duplicate: true,
+					recovered: true,
+					orderId: recovered.id,
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		throw err;
+	}
 
 	if (!duplicate) {
 		await ctx.kv.delete(draftKey(orderDraftId));

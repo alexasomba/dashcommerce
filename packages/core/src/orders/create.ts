@@ -38,6 +38,7 @@ import { decrementForOrderItem } from "../inventory/decrement";
 import { issueGrantsForOrder } from "../downloads/grant";
 import { sendOrderReceipt } from "./receipt";
 import { reconcilePaymentAmount } from "./reconcile";
+import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
 import type { StripePaymentIntent } from "../stripe/payment-intents";
 
 type OrdersStore = StorageCollection<Order>;
@@ -403,7 +404,11 @@ export async function createOrderFromPaymentIntent(
 	// the number that actually landed on disk.
 	Object.assign(order, persistedOrder);
 	await orderItemsStore(ctx).putMany(
-		items.map((it) => ({ id: it.id, data: it })),
+		items.map((it) => ({
+			id: it.id,
+			// Cast: storage row intentionally omits uniquely-indexed `sku`.
+			data: orderItemToStorage(it) as unknown as OrderItem,
+		})),
 	);
 
 	// (5) Decrement stock + write ledger per line.
@@ -501,7 +506,9 @@ export async function loadOrderItems(
 	orderId: string,
 ): Promise<OrderItem[]> {
 	const result = await orderItemsStore(ctx).query({ where: { orderId }, limit: 200 });
-	return result.items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
+	return result.items.map((r) =>
+		orderItemFromStorage(r.id, r.data as OrderItem),
+	);
 }
 
 export { findOrderByPaymentIntent };

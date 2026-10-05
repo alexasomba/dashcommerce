@@ -18,10 +18,15 @@ import type {
 	CartLineItem,
 	CartState,
 	Coupon,
+	OrderItem,
 	ProductFields,
 	ProductVariant,
 	ShippingMethod,
 } from "../src/types";
+import {
+	orderItemFromStorage,
+	orderItemToStorage,
+} from "../src/orders/order-item-storage";
 
 function line(
 	productId: string,
@@ -310,5 +315,60 @@ describe("checkout totals integrity composition", () => {
 		expect(result.discountTotal.amount).toBe(1_000);
 		expect(result.shippingTotal.amount).toBe(500);
 		expect(result.total.amount).toBe(4_500);
+	});
+});
+
+
+describe("order item storage sku mapping", () => {
+	function sampleItem(sku: string): OrderItem {
+		return {
+			id: "oi_1",
+			orderId: "ord_1",
+			productId: "prod_1",
+			sku,
+			name: "Mug",
+			quantity: 1,
+			unitPrice: money("USD", 1000),
+			lineSubtotal: money("USD", 1000),
+			discountAmount: zero("USD"),
+			taxAmount: zero("USD"),
+			total: money("USD", 1000),
+			isDigital: false,
+		};
+	}
+
+	it("omits blank sku so EmDash unique $.sku index cannot collide across orders", () => {
+		const stored = orderItemToStorage(sampleItem(""));
+		expect("sku" in stored).toBe(false);
+		expect("productSku" in stored).toBe(false);
+
+		const storedBlank = orderItemToStorage(sampleItem("   "));
+		expect("sku" in storedBlank).toBe(false);
+		expect("productSku" in storedBlank).toBe(false);
+	});
+
+	it("persists catalog sku under productSku, not sku", () => {
+		const stored = orderItemToStorage(sampleItem("MUG-001"));
+		expect(stored.productSku).toBe("MUG-001");
+		expect("sku" in stored).toBe(false);
+	});
+
+	it("two storage rows with blank catalog sku do not share a $.sku value", () => {
+		const a = orderItemToStorage({ ...sampleItem(""), id: "oi_a", orderId: "ord_a" });
+		const b = orderItemToStorage({ ...sampleItem(""), id: "oi_b", orderId: "ord_b" });
+		// EmDash unique index keys on json_extract($.sku); both must be absent/undefined.
+		expect((a as { sku?: string }).sku).toBeUndefined();
+		expect((b as { sku?: string }).sku).toBeUndefined();
+		expect(JSON.stringify(a)).not.toContain('"sku"');
+		expect(JSON.stringify(b)).not.toContain('"sku"');
+	});
+
+	it("reads productSku (and legacy sku) back into OrderItem.sku", () => {
+		expect(orderItemFromStorage("oi_1", { ...sampleItem("x"), productSku: "MUG-001", sku: undefined }).sku).toBe(
+			"MUG-001",
+		);
+		expect(orderItemFromStorage("oi_2", { ...sampleItem(""), sku: "LEGACY" }).sku).toBe("LEGACY");
+		const { sku: _s, ...rest } = sampleItem("");
+		expect(orderItemFromStorage("oi_3", rest).sku).toBe("");
 	});
 });
