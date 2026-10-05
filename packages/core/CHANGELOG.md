@@ -1,5 +1,13 @@
 # Changelog — @dashcommerce/core
 
+## 0.2.1
+
+### Patch Changes
+
+- [#34](https://github.com/emdashCommerce/dashcommerce/pull/34) [`55ca9fa`](https://github.com/emdashCommerce/dashcommerce/commit/55ca9fa5408619f717c92ff020e59ce04a49a4cd) Thanks [@cavewebs](https://github.com/cavewebs)! - Harden checkout and Stripe webhook payment integrity: verify variant ownership, re-resolve coupon/shipping amounts at checkout, require paid payment status (incl. async success), and reconcile PaymentIntent amounts; fix hosted Checkout Session tax/discount line items.
+
+- [#26](https://github.com/emdashCommerce/dashcommerce/pull/26) [`bcdad21`](https://github.com/emdashCommerce/dashcommerce/commit/bcdad21b6519442c5f62bdf6b5382179f69d5570) Thanks [@cavewebs](https://github.com/cavewebs)! - Railway/reverse-proxy: use configured public site URL for Stripe success/cancel and portal return URLs instead of request.origin which can be localhost:PORT
+
 ## 0.2.0
 
 ### Minor Changes
