@@ -1,5 +1,11 @@
 # Changelog — @dashcommerce/core
 
+## 0.2.2
+
+### Patch Changes
+
+- [#36](https://github.com/emdashCommerce/dashcommerce/pull/36) [`2b462ee`](https://github.com/emdashCommerce/dashcommerce/commit/2b462ee05cd09a1a94968fbd4589795aded8a8e9) Thanks [@cavewebs](https://github.com/cavewebs)! - Widen the `emdash` peer to `>=0.37.0 <0.38.0 || >=1.1.0 <2.0.0` so current EmDash 1.x installs pass peer checks without bricking 0.37.x. The runtime compatibility check matches that range (skipping untested 0.38–0.42 and the mistaken `emdash@1.0.0` publish). Dual-version patches keep Stripe webhook raw-body reads and raw `Response` passthrough working on both 0.37.0 and 1.1.0.
+
 ## 0.2.1
 
 ### Patch Changes
