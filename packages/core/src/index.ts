@@ -9,11 +9,13 @@
 
 import type { PluginDescriptor } from "emdash";
 
+import pkg from "../package.json" with { type: "json" };
 import { DASHCOMMERCE_STORAGE } from "./storage-collections";
 import { detectEmDashVersionAtBuildTime } from "./version-check";
 
 export const DASHCOMMERCE_PLUGIN_ID = "dashcommerce";
-export const DASHCOMMERCE_VERSION = "0.2.0";
+/** Sourced from package.json so Changesets version bumps cannot drift. */
+export const DASHCOMMERCE_VERSION: string = pkg.version;
 
 export interface DashCommerceOptions {
 	/**
