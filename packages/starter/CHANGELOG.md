@@ -1,5 +1,12 @@
 # @dashcommerce/starter
 
+## 0.3.3
+
+### Patch Changes
+
+- Updated dependencies [[`2b462ee`](https://github.com/emdashCommerce/dashcommerce/commit/2b462ee05cd09a1a94968fbd4589795aded8a8e9)]:
+  - @dashcommerce/core@0.2.2
+
 ## 0.3.2
 
 ### Patch Changes
