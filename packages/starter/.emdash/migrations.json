@@ -1,6 +1,6 @@
 {
 	"schemaVersion": 1,
-	"emdashVersion": "0.37.0",
+	"emdashVersion": "1.1.0",
 	"migrationSet": {
 		"names": [
 			"001_initial",
@@ -75,14 +75,31 @@
 			"071_restore_content_bylines_table",
 			"072_media_folders",
 			"073_media_focal_point",
-			"074_content_deleted_scheduled_index"
+			"074_content_deleted_scheduled_index",
+			"075_entry_edit_locks",
+			"076_collection_nav_group",
+			"077_plugin_storage_revisions",
+			"078_menu_item_translation_groups",
+			"079_datetime_normalization",
+			"080_content_translation_locale_unique",
+			"081_redirect_write_guards",
+			"082_taxonomy_translation_locale_unique",
+			"083_block_types",
+			"084_site_transfer",
+			"085_taxonomy_def_groups",
+			"086_relations_structural",
+			"087_reference_field_relations",
+			"088_cron_oneshot_utc",
+			"089_auto_seed_completion",
+			"090_redirect_enable_loop_guard",
+			"091_redirect_artifacts"
 		],
-		"fingerprint": "6864996c26aae72fb939ee06ab5408d1e877d50e3da5e93c805af1819e0bed22"
+		"fingerprint": "319ab15f96c2b36351ff1c748631e0c9c586914737650062d7cf69152046b69b"
 	},
 	"i18n": null,
 	"database": {
 		"type": "sqlite",
-		"executorEntrypoint": "emdash/db/sqlite-migrations",
+		"executorEntrypoint": "emdash/internal/db/sqlite-migrations",
 		"executorConfig": {
 			"url": "file:./data.db"
 		}
