@@ -48,7 +48,8 @@ jobs:
       fail-fast: false
       matrix:
         emdash-version:
-          - "0.37.0"  # Current minimum supported version
+          - "0.37.0"  # Oldest supported (keep 0.37 installs unbricked)
+          - "1.1.0"   # Current EmDash 1.x line
           # Add new versions as they're tested and verified
     steps:
       - uses: actions/checkout@v4
@@ -65,13 +66,28 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun add -d emdash@${{ matrix.emdash-version }} @emdash-cms/admin@${{ matrix.emdash-version }}
+          bun add -d --cwd packages/core emdash@${{ matrix.emdash-version }} @emdash-cms/admin@${{ matrix.emdash-version }}
           bun add --cwd packages/starter emdash@${{ matrix.emdash-version }} @emdash-cms/cloudflare@${{ matrix.emdash-version }}
 
-      - name: Typecheck
-        run: bun run typecheck
+      - name: Typecheck core + create
+        run: |
+          bun run --cwd packages/core typecheck
+          bun run --cwd packages/create typecheck
 
-      - name: Build
-        run: bun run build
+      - name: Build core + create
+        run: |
+          bun run --cwd packages/core build
+          bun run --cwd packages/create build
 
       - name: Test
         run: bun run test
+
+      # Starter tracks EmDash 1.x (migrations.json + emdash/internal/*).
+      # Skip it on the 0.37 matrix job so we still validate the published
+      # plugin against the oldest supported host without requiring the
+      # demo site to dual-boot 0.37 and 1.x schemas.
+      - name: Typecheck + build starter
+        if: matrix.emdash-version != '0.37.0'
+        run: |
+          bun run --cwd packages/starter typecheck
+          bun run --cwd packages/starter build

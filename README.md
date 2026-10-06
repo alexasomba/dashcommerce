@@ -23,12 +23,12 @@ Scaffolds a complete storefront with EmDash + DashCommerce, demo products, and S
 
 ## Current Release
 
-**v0.2.0** on npm — peer range **EmDash `>=0.37.0 <0.38.0`** (EmDash 0.38 day-one compat is ready in [PR #28](https://github.com/emdashCommerce/dashcommerce/pull/28); merge ships as `0.2.1`).
+**v0.2.1** on npm — peer **EmDash `>=0.37.0 <0.38.0 || >=1.1.0 <2.0.0`**. 0.37.x installs stay valid; current EmDash 1.x installs pass peer checks. Skip `emdash@1.0.0` (wrong codebase on npm) and untested 0.38–0.42.
 
 | Package | Version | EmDash Compatibility |
 |---|---|---|
-| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.0 | EmDash 0.37.x |
-| `@dashcommerce/create` | 0.2.0 | Scaffolds EmDash 0.37.x projects |
+| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.1 | EmDash 0.37.x or 1.1+ |
+| `@dashcommerce/create` | 0.2.0 | Scaffolds from the starter (track the core peer) |
 
 Stay on **0.1.x** if you need EmDash 0.28.x — that line remains on npm and is not bricked by 0.2.x.
 
@@ -36,7 +36,7 @@ The v1.0 feature roadmap is code-complete. SemVer: `0.x` may include minor break
 
 ### Discoverability (next bet)
 
-EmDash now ships an experimental [plugin registry](https://docs.emdashcms.com/plugins/registry/) (`registry.emdashcms.com`). Listing DashCommerce there — once Atmosphere publisher credentials are ready — is the highest-leverage organic install path after npm. Tracked as a follow-up after EmDash 0.38 peer ship.
+EmDash ships a [plugin registry](https://docs.emdashcms.com/plugins/registry/) (`registry.emdashcms.com`). Listing DashCommerce there — once Atmosphere publisher credentials are ready — is the highest-leverage organic install path after npm.
 
 ## Why DashCommerce
 
@@ -65,7 +65,7 @@ See [**What's in the box**](#whats-in-the-box) below for the complete feature br
 
 DashCommerce 0.2.x requires EmDash 0.37+. If you're on 0.1.x (EmDash 0.28.x), follow the migration guide below.
 
-**⚠️ Important**: Do NOT mix DashCommerce 0.2.x with EmDash < 0.37.0, or DashCommerce 0.1.x with EmDash >= 0.29.0. Incompatible versions fail with clear error messages at plugin initialization.
+**⚠️ Important**: Do NOT mix DashCommerce 0.2.x with EmDash < 0.37.0, or DashCommerce 0.1.x with EmDash >= 0.29.0. Incompatible versions fail with clear error messages at plugin initialization. 0.2.x after this peer catch-up also accepts EmDash 1.1+.
 
 ### Upgrade Path: 0.1.x → 0.2.x
 
@@ -74,22 +74,26 @@ DashCommerce 0.2.x requires EmDash 0.37+. If you're on 0.1.x (EmDash 0.28.x), fo
 **Step 1: Update all dependencies together**
 
 ```bash
-# Install EmDash 0.37 + DashCommerce 0.2.x simultaneously
-npm install emdash@^0.37.0 @emdash-cms/admin@^0.37.0 @dashcommerce/core@^0.2.0
+# Recommended: EmDash 1.x + DashCommerce 0.2.x
+npm install emdash@^1.1.0 @emdash-cms/admin@^1.1.0 @dashcommerce/core@^0.2.0
 
 # For Cloudflare deployments, also update:
-npm install @emdash-cms/cloudflare@^0.37.0
+npm install @emdash-cms/cloudflare@^1.1.0
+
+# Or stay on EmDash 0.37.x:
+npm install emdash@^0.37.0 @emdash-cms/admin@^0.37.0 @dashcommerce/core@^0.2.0
 ```
 
 **Step 2: Apply EmDash patch (required)**
 
-DashCommerce requires [a small patch to EmDash](/packages/core/patches/emdash@0.37.0.patch) for webhook handling and response passthrough. The patch is shipped with `@dashcommerce/core@0.2.0` and documented in [`packages/core/patches/README.md`](/packages/core/patches/README.md).
+DashCommerce requires [a small patch to EmDash](/packages/core/patches/emdash@1.1.0.patch) for webhook handling and response passthrough. The matching 0.37.0 patch is shipped alongside it. See [`packages/core/patches/README.md`](/packages/core/patches/README.md).
 
 ```bash
-# Using Bun (recommended) - add to package.json:
+# Using Bun (recommended) - add to package.json (use the key that matches your resolved emdash version):
 {
   "patchedDependencies": {
-    "emdash@0.37.0": "node_modules/@dashcommerce/core/patches/emdash@0.37.0.patch"
+    "emdash@0.37.0": "node_modules/@dashcommerce/core/patches/emdash@0.37.0.patch",
+    "emdash@1.1.0": "node_modules/@dashcommerce/core/patches/emdash@1.1.0.patch"
   }
 }
 
@@ -144,8 +148,8 @@ The 0.1.x line remains on npm and will continue working with EmDash 0.28.x. Howe
 
 ### Breaking Changes in 0.2.0
 
-- **Minimum EmDash version**: Now `0.37.0` (was `0.28.0`)
-- **Patch required**: Must apply `emdash@0.37.0` patch for webhooks to work
+- **Minimum EmDash version**: Now `0.37.0` (was `0.28.0`). Current peer also admits EmDash `>=1.1.0 <2.0.0`.
+- **Patch required**: Apply the patch that matches your resolved EmDash version (`emdash@0.37.0` or `emdash@1.1.0`) for webhooks and raw Response passthrough
 - **Node.js builds**: Must externalize `cloudflare:*` modules in Vite config
 - **Runtime version check**: Plugin will throw on incompatible EmDash versions (fail-closed for safety)
 

@@ -6,13 +6,37 @@
  * This prevents silent breakage when EmDash is upgraded beyond the tested range.
  */
 
+export interface EmDashVersionRange {
+	/** Inclusive lower bound. */
+	min: string;
+	/** Exclusive upper bound. */
+	maxExclusive: string;
+}
+
+const EMDASH_037: EmDashVersionRange = { min: "0.37.0", maxExclusive: "0.38.0" };
+const EMDASH_1X: EmDashVersionRange = { min: "1.1.0", maxExclusive: "2.0.0" };
+
 /**
- * Supported EmDash version range for DashCommerce.
+ * Supported EmDash version ranges for DashCommerce.
  * Update this when upgrading and testing against newer EmDash versions.
+ *
+ * Dual range on purpose:
+ * - 0.37.x remains supported for existing installs
+ * - 1.1.x–1.x is the current EmDash line
+ * - 0.38–0.42 and the mistaken `1.0.0` publish are untested / unsafe
+ */
+export const SUPPORTED_EMDASH_RANGES: readonly EmDashVersionRange[] = [EMDASH_037, EMDASH_1X];
+
+/** npm-style peer string matching {@link SUPPORTED_EMDASH_RANGES}. */
+export const SUPPORTED_EMDASH_PEER = ">=0.37.0 <0.38.0 || >=1.1.0 <2.0.0";
+
+/**
+ * @deprecated Use {@link SUPPORTED_EMDASH_RANGES}. Kept as the 0.37.x window
+ * so older call sites that read `.min` still see the true floor.
  */
 export const SUPPORTED_EMDASH_RANGE = {
-	min: "0.37.0",
-	max: "0.38.0", // exclusive
+	min: EMDASH_037.min,
+	max: EMDASH_037.maxExclusive,
 } as const;
 
 /**
@@ -37,18 +61,33 @@ function parseVersion(version: string): { major: number; minor: number; patch: n
 function compareVersions(a: string, b: string): number {
 	const aParsed = parseVersion(a);
 	const bParsed = parseVersion(b);
-	
+
 	if (!aParsed || !bParsed) {
 		// If we can't parse, fail closed - better to throw than silently run incompatible code
 		throw new Error(
 			`DashCommerce: Unable to parse version strings for compatibility check. ` +
-			`Got: "${a}" vs "${b}". This is a bug, please report it.`,
+				`Got: "${a}" vs "${b}". This is a bug, please report it.`,
 		);
 	}
-	
+
 	if (aParsed.major !== bParsed.major) return aParsed.major - bParsed.major;
 	if (aParsed.minor !== bParsed.minor) return aParsed.minor - bParsed.minor;
 	return aParsed.patch - bParsed.patch;
+}
+
+function isInRange(installedVersion: string, range: EmDashVersionRange): boolean {
+	return (
+		compareVersions(installedVersion, range.min) >= 0 &&
+		compareVersions(installedVersion, range.maxExclusive) < 0
+	);
+}
+
+export function isEmDashVersionSupported(installedVersion: string): boolean {
+	return SUPPORTED_EMDASH_RANGES.some((range) => isInRange(installedVersion, range));
+}
+
+export function formatSupportedEmDashRanges(): string {
+	return SUPPORTED_EMDASH_PEER;
 }
 
 /**
@@ -59,42 +98,39 @@ function compareVersions(a: string, b: string): number {
  * @throws Error if the version is incompatible
  */
 export function checkEmDashVersion(installedVersion: string): void {
-	const { min, max } = SUPPORTED_EMDASH_RANGE;
-	
-	// Check if below minimum
-	if (compareVersions(installedVersion, min) < 0) {
+	if (isEmDashVersionSupported(installedVersion)) return;
+
+	const floor = EMDASH_037.min;
+	if (compareVersions(installedVersion, floor) < 0) {
 		throw new Error(
 			`[DashCommerce] EmDash version incompatibility detected!\n\n` +
-			`Minimum required: ${min}\n` +
-			`Found: ${installedVersion}\n\n` +
-			`To upgrade, run:\n` +
-			`  npm install emdash@^0.37.0 @emdash-cms/admin@^0.37.0 @dashcommerce/core@^0.2.0\n\n` +
-			`Or to stay on the old version:\n` +
-			`  npm install @dashcommerce/core@^0.1.5\n` +
-			`See https://github.com/emdashCommerce/dashcommerce#migration for details.`,
+				`Minimum required: ${floor}\n` +
+				`Found: ${installedVersion}\n\n` +
+				`To upgrade, run:\n` +
+				`  npm install emdash@^1.1.0 @emdash-cms/admin@^1.1.0 @dashcommerce/core@^0.2.0\n\n` +
+				`Or to stay on the old version:\n` +
+				`  npm install @dashcommerce/core@^0.1.5\n` +
+				`See https://github.com/emdashCommerce/dashcommerce#migration for details.`,
 		);
 	}
-	
-	// Check if at or above maximum (exclusive)
-	if (compareVersions(installedVersion, max) >= 0) {
-		throw new Error(
-			`[DashCommerce] EmDash version incompatibility detected!\n\n` +
-			`Supported versions: ${min} - ${max} (exclusive)\n` +
+
+	throw new Error(
+		`[DashCommerce] EmDash version incompatibility detected!\n\n` +
+			`Supported versions: ${formatSupportedEmDashRanges()}\n` +
 			`Found: ${installedVersion}\n\n` +
 			`This version of DashCommerce (@dashcommerce/core@0.2.x) has not been tested with EmDash ${installedVersion}.\n\n` +
 			`To fix, upgrade DashCommerce:\n` +
 			`  npm install @dashcommerce/core@latest\n\n` +
-			`If no compatible version is available, stay on EmDash 0.37.x:\n` +
-			`  npm install emdash@^0.37.0 @emdash-cms/admin@^0.37.0\n` +
+			`Supported hosts: EmDash 0.37.x, or EmDash 1.1+ (not 1.0.0 — that npm publish is the wrong codebase).\n` +
+			`  npm install emdash@^1.1.0 @emdash-cms/admin@^1.1.0\n` +
 			`See https://github.com/emdashCommerce/dashcommerce#migration for details.`,
-		);
-	}
+	);
 }
 
 /**
  * Detect the EmDash version at build time by importing package.json.
  * This only works in the build context (astro.config.mjs), not in sandbox.
- * 
+ *
  * @returns The detected EmDash version string, or null if detection fails
  */
 export function detectEmDashVersionAtBuildTime(): string | null {
@@ -110,19 +146,19 @@ export function detectEmDashVersionAtBuildTime(): string | null {
 
 /**
  * Validate EmDash compatibility at plugin initialization.
- * 
+ *
  * This function is called when the plugin is loaded. It will:
  * 1. Use the provided emdashVersion if available (passed from descriptor)
  * 2. If version is detected and out of range: THROW (fail closed for safety)
  * 3. If no version provided: WARN but continue (fail open for compatibility)
- * 
+ *
  * Fail-open behavior when version is unavailable is necessary because:
  * - Sandboxed plugins cannot detect the version at runtime
  * - We rely on the build-time check in the descriptor
  * - We don't want to break existing working installs
- * 
+ *
  * The build-time assertion and peer dependencies provide additional safety layers.
- * 
+ *
  * @param emdashVersion - The EmDash version detected at build time (optional)
  */
 export function validateEmDashCompatibility(emdashVersion?: string): void {
@@ -131,12 +167,12 @@ export function validateEmDashCompatibility(emdashVersion?: string): void {
 		// This is fail-open behavior for maximum compatibility
 		console.warn(
 			`[DashCommerce] WARNING: EmDash version not provided to compatibility check.\n` +
-			`Ensure EmDash ${SUPPORTED_EMDASH_RANGE.min} - ${SUPPORTED_EMDASH_RANGE.max} is installed.\n` +
-			`If you experience issues, verify compatibility: https://github.com/emdashCommerce/dashcommerce#compatibility`,
+				`Ensure EmDash ${formatSupportedEmDashRanges()} is installed.\n` +
+				`If you experience issues, verify compatibility: https://github.com/emdashCommerce/dashcommerce#compatibility`,
 		);
 		return;
 	}
-	
+
 	// Version provided - FAIL CLOSED for safety
 	try {
 		checkEmDashVersion(emdashVersion);
