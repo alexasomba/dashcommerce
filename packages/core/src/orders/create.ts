@@ -20,26 +20,26 @@
  */
 
 import type { PluginContext, StorageCollection } from "emdash";
-import { randomId } from "../util/ids";
-import { isUniqueViolation } from "../util/storage";
 import { releaseLock } from "../cart/lock";
+import { issueGrantsForOrder } from "../downloads/grant";
+import { decrementForOrderItem } from "../inventory/decrement";
+import { money, zero } from "../money";
+import type { StripePaymentIntent } from "../stripe/payment-intents";
 import type {
 	CartState,
 	Coupon,
 	CouponUsage,
-	Customer,
 	CurrencyCode,
+	Customer,
 	Order,
 	OrderItem,
 	Refund,
 } from "../types";
-import { money, zero } from "../money";
-import { decrementForOrderItem } from "../inventory/decrement";
-import { issueGrantsForOrder } from "../downloads/grant";
+import { randomId } from "../util/ids";
+import { isUniqueViolation } from "../util/storage";
+import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
 import { sendOrderReceipt } from "./receipt";
 import { reconcilePaymentAmount } from "./reconcile";
-import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
-import type { StripePaymentIntent } from "../stripe/payment-intents";
 
 type OrdersStore = StorageCollection<Order>;
 type OrderItemsStore = StorageCollection<OrderItem>;
@@ -98,10 +98,7 @@ async function nextOrderNumber(ctx: PluginContext): Promise<string> {
  * unique-index conflict. Max 8 retries is plenty — conflict storms
  * converge within log-n rounds.
  */
-async function putOrderWithUniqueNumber(
-	ctx: PluginContext,
-	order: Order,
-): Promise<Order> {
+async function putOrderWithUniqueNumber(ctx: PluginContext, order: Order): Promise<Order> {
 	let candidate = order;
 	const MAX_RETRIES = 8;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
@@ -170,8 +167,7 @@ async function upsertCustomer(
 			ordersCount: prev.ordersCount + 1,
 			totalSpent: {
 				...prev.totalSpent,
-				[input.currency]:
-					(prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
+				[input.currency]: (prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
 			},
 			updatedAt: now,
 		};
@@ -287,9 +283,7 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	if (pi.status !== "succeeded") {
-		throw new Error(
-			`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`,
-		);
+		throw new Error(`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`);
 	}
 
 	const reconcile = reconcilePaymentAmount(cart.total.amount, pi.amount_received);
@@ -304,9 +298,7 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	if (!cart.billingAddress || !cart.shippingAddress) {
-		throw new Error(
-			"Cart snapshot is missing billing or shipping address — cannot create order.",
-		);
+		throw new Error("Cart snapshot is missing billing or shipping address — cannot create order.");
 	}
 
 	const customerEmail = cart.customerEmail ?? pi.receipt_email ?? cart.billingAddress.firstName;
@@ -347,15 +339,12 @@ export async function createOrderFromPaymentIntent(
 			total: line.lineSubtotal,
 			isDigital: line.isDigital,
 			...(line.vendorId ? { vendorId: line.vendorId } : {}),
-			...(line.subscriptionConfig
-				? { subscriptionConfig: line.subscriptionConfig }
-				: {}),
+			...(line.subscriptionConfig ? { subscriptionConfig: line.subscriptionConfig } : {}),
 		};
 		return lineItem;
 	});
 
-	const paidMinor =
-		typeof pi.amount_received === "number" ? pi.amount_received : cart.total.amount;
+	const paidMinor = typeof pi.amount_received === "number" ? pi.amount_received : cart.total.amount;
 
 	const order: Order = {
 		id: orderId,
@@ -379,6 +368,9 @@ export async function createOrderFromPaymentIntent(
 		taxLines: cart.taxLines,
 		couponCodes: cart.coupons.map((c) => c.code),
 		stripePaymentIntentId: pi.id,
+		providerId: pi.metadata?.providerId ?? "stripe",
+		paymentReference: pi.id,
+		...(pi.metadata?.checkoutReference ? { checkoutReference: pi.metadata.checkoutReference } : {}),
 		...(pi.customer ? { stripeCustomerId: pi.customer } : {}),
 		...(pi.latest_charge ? { stripeChargeId: pi.latest_charge } : {}),
 		paymentMethodType: pi.payment_method_types?.[0],
@@ -501,14 +493,9 @@ export async function loadOrder(ctx: PluginContext, orderId: string): Promise<Or
 	return { ...(raw as Order), id: orderId };
 }
 
-export async function loadOrderItems(
-	ctx: PluginContext,
-	orderId: string,
-): Promise<OrderItem[]> {
+export async function loadOrderItems(ctx: PluginContext, orderId: string): Promise<OrderItem[]> {
 	const result = await orderItemsStore(ctx).query({ where: { orderId }, limit: 200 });
-	return result.items.map((r) =>
-		orderItemFromStorage(r.id, r.data as OrderItem),
-	);
+	return result.items.map((r) => orderItemFromStorage(r.id, r.data as OrderItem));
 }
 
 export { findOrderByPaymentIntent };

@@ -1,10 +1,13 @@
 /**
- * Stripe webhook endpoint — public, signature-verified.
+ * Checkout webhook endpoint — public, signature-verified via the active
+ * PaymentProvider (`resolveProvider()`, default `"stripe"`).
  *
  *   POST /checkout/webhook
  *
- * The body is read raw for HMAC verification, then parsed. We dispatch
- * on `event.type`:
+ * The body is read raw for HMAC verification. Stripe events still dispatch
+ * on `event.type` so subscriptions, Connect, refunds, and hosted-session
+ * address merge keep current behaviour:
+
  *
  *   payment_intent.succeeded  → createOrderFromPaymentIntent
  *   checkout.session.completed / async_payment_succeeded → hosted order (paid only)
@@ -20,51 +23,43 @@
  */
 
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
-import { randomId } from "../util/ids";
-import { isUniqueViolation } from "../util/storage";
-import type { CartState, StripeEventRecord } from "../types";
 import { deleteLock, getLock } from "../cart/lock";
 import { clear as clearCart } from "../cart/store";
-import {
-	createOrderFromPaymentIntent,
-	findOrderByPaymentIntent,
-} from "../orders/create";
+import { sendSubscriptionRenewed, sendVendorActivated, sendVendorPayout } from "../emails";
+import { createOrderFromPaymentIntent, findOrderByPaymentIntent } from "../orders/create";
 import { recordRefundFromWebhook } from "../orders/refund";
-import { verifyStripeSignature } from "../stripe/webhook-verify";
+import {
+	type NormalizedPaymentEvent,
+	type PaymentProviderAddress,
+	loadPaymentProviderCredentials,
+	resolveProvider,
+	webhookSignatureHeader,
+} from "../payment-provider";
+import type { StripeCheckoutSession, StripeSessionAddress } from "../stripe/checkout-sessions";
+import type { StripeClientOptions } from "../stripe/client";
+import type { StripeAccount, StripePayout } from "../stripe/connect";
 import type { StripePaymentIntent } from "../stripe/payment-intents";
 import { retrievePaymentIntent } from "../stripe/payment-intents";
-import type {
-	StripeCheckoutSession,
-	StripeSessionAddress,
-} from "../stripe/checkout-sessions";
-import type { StripeClientOptions } from "../stripe/client";
 import type { StripeRefund } from "../stripe/refunds";
-import type { StripeAccount, StripePayout } from "../stripe/connect";
 import type { StripeInvoice, StripeSubscription } from "../stripe/subscriptions";
-import type { Address, CountryCode, Customer } from "../types";
 import {
-	findVendorByStripeAccountId,
-	upsertVendorFromStripeAccount,
-} from "../vendors/onboarding";
-import { recordPayoutFromStripe } from "../vendors/payouts";
-import {
+	findSubscription,
 	subsStore,
 	upsertFromStripe,
 	upsertInvoiceFromStripe,
-	findSubscription,
 } from "../subscriptions/create";
 import { handleInvoicePaymentFailed } from "../subscriptions/dunning";
-import {
-	sendSubscriptionRenewed,
-	sendVendorActivated,
-	sendVendorPayout,
-} from "../emails";
-import { draftKey, type CheckoutDraftSnapshot } from "./checkout";
+import type { CartState, StripeEventRecord } from "../types";
+import type { Address, CountryCode, Customer, Order } from "../types";
+import { randomId } from "../util/ids";
+import { isUniqueViolation } from "../util/storage";
+import { findVendorByStripeAccountId, upsertVendorFromStripeAccount } from "../vendors/onboarding";
+import { recordPayoutFromStripe } from "../vendors/payouts";
+import { type CheckoutDraftSnapshot, draftKey } from "./checkout";
 
 type StripeEventsStore = StorageCollection<StripeEventRecord>;
 function stripeEventsStore(ctx: PluginContext): StripeEventsStore {
-	return (ctx.storage as unknown as { stripe_events: StripeEventsStore })
-		.stripe_events;
+	return (ctx.storage as unknown as { stripe_events: StripeEventsStore }).stripe_events;
 }
 
 /**
@@ -130,10 +125,10 @@ async function handlePaymentIntentSucceeded(
 				headers: { "Content-Type": "application/json" },
 			});
 		}
-		return new Response(
-			JSON.stringify({ received: true, deferredToSessionCompleted: true }),
-			{ status: 200, headers: { "Content-Type": "application/json" } },
-		);
+		return new Response(JSON.stringify({ received: true, deferredToSessionCompleted: true }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
 	}
 
 	// Idempotent: return on duplicate
@@ -424,9 +419,7 @@ async function handleCheckoutSessionCompleted(
 
 	const cart: CartState = {
 		...snapshot.cart,
-		...(session.customer_details?.email
-			? { customerEmail: session.customer_details.email }
-			: {}),
+		...(session.customer_details?.email ? { customerEmail: session.customer_details.email } : {}),
 		...(shippingAddr ? { shippingAddress: shippingAddr } : {}),
 		...(billingAddr
 			? { billingAddress: billingAddr }
@@ -448,10 +441,10 @@ async function handleCheckoutSessionCompleted(
 				sessionId: session.id,
 				orderDraftId,
 			});
-			return new Response(
-				JSON.stringify({ error: "Session missing address" }),
-				{ status: 500, headers: { "Content-Type": "application/json" } },
-			);
+			return new Response(JSON.stringify({ error: "Session missing address" }), {
+				status: 500,
+				headers: { "Content-Type": "application/json" },
+			});
 		}
 	}
 
@@ -459,14 +452,14 @@ async function handleCheckoutSessionCompleted(
 	// fields it reads (amount_received, latest_charge, status, etc.).
 	const client = await loadStripeClient(ctx);
 	if (!client) {
-		return new Response(
-			JSON.stringify({ error: "Stripe not configured" }),
-			{ status: 500, headers: { "Content-Type": "application/json" } },
-		);
+		return new Response(JSON.stringify({ error: "Stripe not configured" }), {
+			status: 500,
+			headers: { "Content-Type": "application/json" },
+		});
 	}
 	const pi = await retrievePaymentIntent(ctx, session.payment_intent, client);
 
-	let order;
+	let order: Order;
 	let duplicate = false;
 	try {
 		({ order, duplicate } = await createOrderFromPaymentIntent(ctx, {
@@ -557,10 +550,7 @@ interface StripeCharge {
 	refunds?: { data: StripeRefund[] };
 }
 
-async function handleChargeRefunded(
-	ctx: PluginContext,
-	charge: StripeCharge,
-): Promise<Response> {
+async function handleChargeRefunded(ctx: PluginContext, charge: StripeCharge): Promise<Response> {
 	if (!charge.payment_intent) {
 		return new Response(JSON.stringify({ received: true, skipped: true }), {
 			status: 200,
@@ -596,21 +586,140 @@ async function readRawBody(req: Request): Promise<string> {
 	return req.clone().text();
 }
 
+function toCartAddress(addr: PaymentProviderAddress): Address {
+	return {
+		firstName: addr.firstName ?? "",
+		lastName: addr.lastName ?? "",
+		line1: addr.line1 ?? "",
+		...(addr.line2 ? { line2: addr.line2 } : {}),
+		city: addr.city ?? "",
+		region: addr.region ?? "",
+		postalCode: addr.postalCode ?? "",
+		country: (addr.country ?? "").toUpperCase() as CountryCode,
+		...(addr.phone ? { phone: addr.phone } : {}),
+	};
+}
+
+async function handleNormalizedChargeSucceeded(
+	ctx: PluginContext,
+	event: Extract<NormalizedPaymentEvent, { type: "charge.succeeded" }>,
+): Promise<Response> {
+	const existing = await findOrderByPaymentIntent(ctx, event.paymentReference);
+	if (existing) {
+		return new Response(JSON.stringify({ received: true, duplicate: true }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	const snapshot = await ctx.kv.get<CheckoutDraftSnapshot>(draftKey(event.orderDraftId));
+	if (!snapshot) {
+		ctx.log.error("No cart snapshot for orderDraftId", {
+			orderDraftId: event.orderDraftId,
+			paymentReference: event.paymentReference,
+		});
+		return new Response(JSON.stringify({ error: "Missing draft snapshot" }), {
+			status: 500,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	const billingAddr = event.billingAddress ? toCartAddress(event.billingAddress) : null;
+	const shippingAddr = event.shippingAddress ? toCartAddress(event.shippingAddress) : null;
+	const cart: CartState = {
+		...snapshot.cart,
+		...(event.customer.email ? { customerEmail: event.customer.email } : {}),
+		...(shippingAddr ? { shippingAddress: shippingAddr } : {}),
+		...(billingAddr
+			? { billingAddress: billingAddr }
+			: shippingAddr
+				? { billingAddress: shippingAddr }
+				: {}),
+	};
+	if (!cart.billingAddress || !cart.shippingAddress) {
+		if (cart.billingAddress && !cart.shippingAddress) {
+			cart.shippingAddress = cart.billingAddress;
+		} else if (cart.shippingAddress && !cart.billingAddress) {
+			cart.billingAddress = cart.shippingAddress;
+		} else {
+			return new Response(JSON.stringify({ error: "Session missing address" }), {
+				status: 500,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+	}
+
+	const { order, duplicate } = await createOrderFromPaymentIntent(ctx, {
+		paymentIntent: {
+			id: event.paymentReference,
+			amount: event.amount,
+			amount_received: event.amount,
+			currency: event.currency.toLowerCase(),
+			status: "succeeded",
+			receipt_email: event.customer.email,
+			metadata: {
+				orderDraftId: event.orderDraftId,
+				providerId: event.providerId,
+				...(event.checkoutReference ? { checkoutReference: event.checkoutReference } : {}),
+			},
+		},
+		cartSnapshot: cart,
+		orderDraftId: event.orderDraftId,
+	});
+
+	if (!duplicate) {
+		await ctx.kv.delete(draftKey(event.orderDraftId));
+		try {
+			await clearCart(ctx, cart.sessionId);
+		} catch (err) {
+			ctx.log.warn("Failed to clear cart after order", {
+				sessionId: cart.sessionId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	return new Response(
+		JSON.stringify({ received: true, orderId: order.id, orderNumber: order.orderNumber }),
+		{ status: 200, headers: { "Content-Type": "application/json" } },
+	);
+}
+
+async function handleNormalizedChargeFailed(
+	ctx: PluginContext,
+	event: Extract<NormalizedPaymentEvent, { type: "charge.failed" }>,
+): Promise<Response> {
+	if (event.orderDraftId) {
+		const lock = await getLock(ctx, event.orderDraftId);
+		if (lock) await deleteLock(ctx, event.orderDraftId);
+	}
+	return new Response(JSON.stringify({ received: true }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
 export const webhookRoutes = {
 	"checkout/webhook": {
 		public: true,
 		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
 			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			const req = routeCtx.request;
-			const sigHeader = req.headers.get("stripe-signature");
+			const provider = await resolveProvider(ctx.kv);
+			const sigHeader = webhookSignatureHeader(req.headers, provider.id);
 			if (!sigHeader) {
-				return new Response(JSON.stringify({ error: "Missing Stripe-Signature" }), {
+				const missing =
+					provider.id === "stripe"
+						? "Missing Stripe-Signature"
+						: `Missing ${provider.id} signature header`;
+				return new Response(JSON.stringify({ error: missing }), {
 					status: 400,
 					headers: { "Content-Type": "application/json" },
 				});
 			}
 
-			const secret = await ctx.kv.get<string>("settings:stripeWebhookSecret");
+			const creds = await loadPaymentProviderCredentials(ctx.kv, provider.id);
+			const secret = creds?.webhookSecret;
 			if (!secret) {
 				return new Response(JSON.stringify({ error: "Webhook secret not configured" }), {
 					status: 500,
@@ -619,17 +728,81 @@ export const webhookRoutes = {
 			}
 
 			const payload = await readRawBody(req);
-			const verified = await verifyStripeSignature({
-				payload,
+			const verified = await provider.verifyWebhook({
+				rawBody: payload,
 				signatureHeader: sigHeader,
 				secret,
 			});
 			if (!verified.ok) {
-				ctx.log.warn("Stripe webhook signature invalid", { reason: verified.reason });
-				return new Response(
-					JSON.stringify({ error: `Invalid signature: ${verified.reason}` }),
-					{ status: 400, headers: { "Content-Type": "application/json" } },
-				);
+				ctx.log.warn("Webhook signature invalid", {
+					providerId: provider.id,
+					reason: verified.reason,
+				});
+				return new Response(JSON.stringify({ error: `Invalid signature: ${verified.reason}` }), {
+					status: 400,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+
+			const normalized = provider.parseWebhookEvent(payload);
+			if (
+				provider.id === "stripe" &&
+				normalized.type === "unhandled" &&
+				normalized.providerEventType === "unparseable"
+			) {
+				return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+
+			const providerEventId = normalized.providerEventId;
+			const eventTypeForDedup =
+				normalized.type === "unhandled" ? normalized.providerEventType : normalized.type;
+
+			// Event-id-level idempotency: duplicate deliveries short-circuit
+			// before any handler runs. Downstream resource-level dedup
+			// (stripePaymentIntentId, stripeRefundId, …) still protects
+			// against out-of-order deliveries for different events against
+			// the same resource. `providerEventId` is Stripe `event.id`.
+			if (providerEventId) {
+				const fresh = await recordStripeEvent(ctx, providerEventId, eventTypeForDedup);
+				if (!fresh) {
+					return new Response(JSON.stringify({ received: true, duplicate: true }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+			}
+
+			if (provider.id !== "stripe") {
+				try {
+					if (normalized.type === "charge.succeeded") {
+						return await handleNormalizedChargeSucceeded(ctx, normalized);
+					}
+					if (normalized.type === "charge.failed") {
+						return await handleNormalizedChargeFailed(ctx, normalized);
+					}
+					return new Response(
+						JSON.stringify({
+							received: true,
+							type: normalized.providerEventType,
+							skipped: true,
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				} catch (err) {
+					ctx.log.error("Webhook handler error", {
+						providerId: provider.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					return new Response(
+						JSON.stringify({
+							error: err instanceof Error ? err.message : "Webhook handler failed",
+						}),
+						{ status: 500, headers: { "Content-Type": "application/json" } },
+					);
+				}
 			}
 
 			let event: {
@@ -646,21 +819,6 @@ export const webhookRoutes = {
 				});
 			}
 
-			// Event-id-level idempotency: duplicate deliveries short-circuit
-			// before any handler runs. Downstream resource-level dedup
-			// (stripePaymentIntentId, stripeRefundId, …) still protects
-			// against out-of-order deliveries for different events against
-			// the same resource.
-			if (event.id) {
-				const fresh = await recordStripeEvent(ctx, event.id, event.type);
-				if (!fresh) {
-					return new Response(
-						JSON.stringify({ received: true, duplicate: true }),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-			}
-
 			try {
 				switch (event.type) {
 					case "payment_intent.succeeded":
@@ -670,10 +828,7 @@ export const webhookRoutes = {
 						);
 					case "payment_intent.payment_failed":
 					case "payment_intent.canceled":
-						return await handlePaymentIntentFailure(
-							ctx,
-							event.data.object as StripePaymentIntent,
-						);
+						return await handlePaymentIntentFailure(ctx, event.data.object as StripePaymentIntent);
 					case "checkout.session.completed":
 					case "checkout.session.async_payment_succeeded":
 						return await handleCheckoutSessionCompleted(
@@ -687,18 +842,12 @@ export const webhookRoutes = {
 							event.data.object as StripeCheckoutSession,
 						);
 					case "charge.refunded":
-						return await handleChargeRefunded(
-							ctx,
-							event.data.object as StripeCharge,
-						);
+						return await handleChargeRefunded(ctx, event.data.object as StripeCharge);
 					case "customer.subscription.created":
 					case "customer.subscription.updated":
 					case "customer.subscription.resumed":
 					case "customer.subscription.paused":
-						await upsertFromStripe(
-							ctx,
-							event.data.object as StripeSubscription,
-						);
+						await upsertFromStripe(ctx, event.data.object as StripeSubscription);
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
@@ -722,19 +871,13 @@ export const webhookRoutes = {
 					case "invoice.payment_succeeded":
 					case "invoice.paid": {
 						const stripeInvoice = event.data.object as StripeInvoice;
-						const invoiceRecord = await upsertInvoiceFromStripe(
-							ctx,
-							stripeInvoice,
-						);
+						const invoiceRecord = await upsertInvoiceFromStripe(ctx, stripeInvoice);
 						// Renewal email on cycle invoices only. The initial
 						// period is covered by the order receipt issued at
 						// checkout, so we skip `subscription_create` /
 						// `subscription` to avoid a duplicate on the very
 						// first paid period.
-						if (
-							invoiceRecord &&
-							stripeInvoice.billing_reason === "subscription_cycle"
-						) {
+						if (invoiceRecord && stripeInvoice.billing_reason === "subscription_cycle") {
 							await sendSubscriptionRenewedEmail(ctx, invoiceRecord);
 						}
 						return new Response(JSON.stringify({ received: true }), {
@@ -743,34 +886,22 @@ export const webhookRoutes = {
 						});
 					}
 					case "invoice.payment_failed":
-						await handleInvoicePaymentFailed(
-							ctx,
-							event.data.object as StripeInvoice,
-						);
+						await handleInvoicePaymentFailed(ctx, event.data.object as StripeInvoice);
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
 						});
 					case "account.updated": {
 						const account = event.data.object as StripeAccount;
-						const previous =
-							await findVendorByStripeAccountId(ctx, account.id);
+						const previous = await findVendorByStripeAccountId(ctx, account.id);
 						const wasActive =
-							previous?.onboardingStatus === "active" &&
-							previous.chargesEnabled === true;
-						const vendor = await upsertVendorFromStripeAccount(
-							ctx,
-							account,
-						);
+							previous?.onboardingStatus === "active" && previous.chargesEnabled === true;
+						const vendor = await upsertVendorFromStripeAccount(ctx, account);
 						// Activation edge: chargesEnabled flipped false→true.
 						// Email is idempotent via a KV marker inside the send
 						// helper, so even webhook retries won't dupe.
 						if (vendor && !wasActive && vendor.chargesEnabled) {
-							await sendVendorActivated(
-								ctx,
-								vendor,
-								ctx.url("/vendor/dashboard"),
-							);
+							await sendVendorActivated(ctx, vendor, ctx.url("/vendor/dashboard"));
 						}
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
@@ -792,23 +923,11 @@ export const webhookRoutes = {
 								headers: { "Content-Type": "application/json" },
 							});
 						}
-						const payoutRecord = await recordPayoutFromStripe(
-							ctx,
-							acctRaw,
-							payout,
-						);
+						const payoutRecord = await recordPayoutFromStripe(ctx, acctRaw, payout);
 						if (payoutRecord && event.type === "payout.paid") {
-							const vendor = await findVendorByStripeAccountId(
-								ctx,
-								acctRaw,
-							);
+							const vendor = await findVendorByStripeAccountId(ctx, acctRaw);
 							if (vendor) {
-								await sendVendorPayout(
-									ctx,
-									vendor,
-									payoutRecord,
-									ctx.url("/vendor/dashboard"),
-								);
+								await sendVendorPayout(ctx, vendor, payoutRecord, ctx.url("/vendor/dashboard"));
 							}
 						}
 						return new Response(JSON.stringify({ received: true }), {
