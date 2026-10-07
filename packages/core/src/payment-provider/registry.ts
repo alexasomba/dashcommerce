@@ -42,6 +42,18 @@ export function getPaymentProvider(id: string): PaymentProvider | undefined {
 	return registry.get(id);
 }
 
+/** Resolve a provider by id. Throws if it was never registered — never silently fall back to Stripe. */
+export function requirePaymentProvider(id: string): PaymentProvider {
+	const provider = registry.get(id);
+	if (!provider) {
+		throw new Error(
+			`Payment provider "${id}" is not registered. ` +
+				`Registered: ${Array.from(registry.keys()).join(", ") || "(none)"}.`,
+		);
+	}
+	return provider;
+}
+
 export function listPaymentProviders(): PaymentProvider[] {
 	return Array.from(registry.values());
 }
@@ -59,12 +71,62 @@ interface KVLike {
 export async function resolveProvider(kv: KVLike): Promise<PaymentProvider> {
 	const configured =
 		(await kv.get<string>("settings:paymentProvider")) ?? DEFAULT_PAYMENT_PROVIDER_ID;
-	const provider = registry.get(configured);
-	if (!provider) {
-		throw new Error(
-			`dashcommerce: settings:paymentProvider is "${configured}" but no PaymentProvider with that id is registered. ` +
-				`Registered: ${Array.from(registry.keys()).join(", ") || "(none)"}.`,
-		);
+	return requirePaymentProvider(configured);
+}
+
+function specificSignatureHeader(headers: Headers, providerId: string): string | null {
+	if (providerId === "stripe") return headers.get("stripe-signature");
+	return headers.get(`x-${providerId}-signature`);
+}
+
+/**
+ * Pick the webhook adapter from the request, not only from the current
+ * `settings:paymentProvider`. In-flight Stripe Checkout / PaymentIntent /
+ * subscription / Connect events must still verify after a merchant switches
+ * the active provider.
+ *
+ * Precedence: `?provider=` → unambiguous signature header (`stripe-signature`,
+ * `x-<id>-signature`) → configured setting.
+ */
+export async function resolveWebhookProvider(
+	kv: KVLike,
+	headers: Headers,
+	requestUrl?: string,
+): Promise<{ provider: PaymentProvider; signatureHeader: string | null }> {
+	if (requestUrl) {
+		try {
+			const fromQuery = new URL(requestUrl).searchParams.get("provider");
+			if (fromQuery) {
+				const provider = requirePaymentProvider(fromQuery);
+				return {
+					provider,
+					signatureHeader: specificSignatureHeader(headers, provider.id),
+				};
+			}
+		} catch {
+			// ignore invalid URLs; fall through
+		}
 	}
-	return provider;
+
+	const stripeSig = headers.get("stripe-signature");
+	if (stripeSig) {
+		return { provider: requirePaymentProvider("stripe"), signatureHeader: stripeSig };
+	}
+
+	for (const provider of registry.values()) {
+		if (provider.id === "stripe") continue;
+		const header = headers.get(`x-${provider.id}-signature`);
+		if (header) {
+			return { provider, signatureHeader: header };
+		}
+	}
+
+	const provider = await resolveProvider(kv);
+	return {
+		provider,
+		signatureHeader:
+			specificSignatureHeader(headers, provider.id) ??
+			headers.get("x-webhook-signature") ??
+			headers.get("signature"),
+	};
 }

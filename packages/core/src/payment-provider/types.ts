@@ -178,6 +178,7 @@ export interface CreateRefundInput {
 	amount?: number;
 	currency: string;
 	reason?: string;
+	metadata?: Record<string, string>;
 }
 
 export interface RefundResult {
@@ -205,9 +206,32 @@ export interface PaymentProviderRuntimeContext {
 	};
 }
 
+export interface PaymentProviderCapabilities {
+	/** Merchant-engine discounts on hosted checkout (Stripe one-time coupons). */
+	coupons?: boolean;
+	/** Connect / destination charges + application fees. */
+	connect?: boolean;
+	/** Recurring `mode: "subscription"` checkout. */
+	subscriptions?: boolean;
+}
+
+export interface PaymentStatusResult {
+	status: "pending" | "succeeded" | "failed";
+	paymentReference?: string;
+	amount?: number;
+	currency?: string;
+	reason?: string;
+}
+
 export interface PaymentProvider {
 	readonly id: string;
 	readonly label: string;
+	/**
+	 * Features this adapter actually implements. Missing/false means
+	 * hosted checkout must reject the cart rather than silently drop
+	 * coupons, Connect splits, or subscriptions.
+	 */
+	readonly capabilities?: PaymentProviderCapabilities;
 
 	/** True if this provider can charge `currency` (ISO-4217). */
 	supportsCurrency(currency: string): boolean;
@@ -233,4 +257,15 @@ export interface PaymentProvider {
 	): Promise<RefundResult>;
 
 	formatAmount(amount: number, currency: string): string;
+
+	/**
+	 * Optional live retrieve. Generic webhooks call this when present so
+	 * a spoofed amount/currency in the payload cannot silently match a
+	 * cart in a different currency.
+	 */
+	getPaymentStatus?(
+		ctx: PaymentProviderRuntimeContext,
+		paymentReference: string,
+		credentials: PaymentProviderCredentials,
+	): Promise<PaymentStatusResult>;
 }

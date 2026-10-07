@@ -16,7 +16,7 @@ import {
 	createCheckoutSession,
 } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
-import type { StripePaymentIntent } from "../stripe/payment-intents";
+import { type StripePaymentIntent, retrievePaymentIntent } from "../stripe/payment-intents";
 import { createRefund as stripeCreateRefund } from "../stripe/refunds";
 import { verifyStripeSignature } from "../stripe/webhook-verify";
 import { addressFromProviderSession, withBillingShippingFallback } from "./addresses";
@@ -28,10 +28,18 @@ import type {
 	PaymentProvider,
 	PaymentProviderCredentials,
 	PaymentProviderRuntimeContext,
+	PaymentStatusResult,
 	RefundResult,
 	VerifyWebhookInput,
 	VerifyWebhookResult,
 } from "./types";
+
+function stripeRefundReason(reason?: string): "duplicate" | "fraudulent" | "requested_by_customer" {
+	if (reason === "duplicate" || reason === "fraudulent" || reason === "requested_by_customer") {
+		return reason;
+	}
+	return "requested_by_customer";
+}
 
 function toStripeClient(credentials: PaymentProviderCredentials): StripeClientOptions {
 	return { secretKey: credentials.secretKey };
@@ -157,6 +165,11 @@ function parseStripeEvent(rawBody: string): {
 export const stripePaymentProvider: PaymentProvider = {
 	id: "stripe",
 	label: "Stripe",
+	capabilities: {
+		coupons: true,
+		connect: true,
+		subscriptions: true,
+	},
 
 	supportsCurrency(currency: string): boolean {
 		if (!currency || typeof currency !== "string") return false;
@@ -326,12 +339,8 @@ export const stripePaymentProvider: PaymentProvider = {
 			{
 				paymentIntent: paymentReference,
 				amount: input.amount,
-				reason:
-					input.reason === "duplicate" ||
-					input.reason === "fraudulent" ||
-					input.reason === "requested_by_customer"
-						? input.reason
-						: undefined,
+				reason: stripeRefundReason(input.reason),
+				...(input.metadata ? { metadata: input.metadata } : {}),
 			},
 			toStripeClient(credentials),
 			refundRequestId,
@@ -352,5 +361,31 @@ export const stripePaymentProvider: PaymentProvider = {
 
 	formatAmount(amount: number, currency: string): string {
 		return format(money(currency, amount));
+	},
+
+	async getPaymentStatus(
+		ctx: PaymentProviderRuntimeContext,
+		paymentReference: string,
+		credentials: PaymentProviderCredentials,
+	): Promise<PaymentStatusResult> {
+		const pi = await retrievePaymentIntent(
+			asPluginContext(ctx),
+			paymentReference,
+			toStripeClient(credentials),
+		);
+		const amount = typeof pi.amount_received === "number" ? pi.amount_received : pi.amount;
+		const status: PaymentStatusResult["status"] =
+			pi.status === "succeeded"
+				? "succeeded"
+				: pi.status === "canceled" || pi.status === "payment_failed"
+					? "failed"
+					: "pending";
+		return {
+			status,
+			paymentReference: pi.id,
+			amount,
+			currency: (pi.currency ?? "").toUpperCase(),
+			...(status !== "succeeded" ? { reason: `stripe status ${pi.status}` } : {}),
+		};
 	},
 };

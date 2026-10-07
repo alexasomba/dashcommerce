@@ -3,6 +3,8 @@ export {
 	splitPersonName,
 	withBillingShippingFallback,
 } from "./addresses";
+export { unsupportedHostedCheckoutFeatures } from "./capabilities";
+export type { RequestedHostedCheckoutFeatures } from "./capabilities";
 export {
 	loadPaymentProviderCredentials,
 	webhookSignatureHeader,
@@ -14,8 +16,10 @@ export {
 	getPaymentProvider,
 	listPaymentProviders,
 	registerPaymentProvider,
+	requirePaymentProvider,
 	resetPaymentProviders,
 	resolveProvider,
+	resolveWebhookProvider,
 } from "./registry";
 export type { RegisterProviderOptions } from "./registry";
 export { stripePaymentProvider, toCreateCheckoutSessionInput } from "./stripe-provider";
@@ -26,11 +30,13 @@ export type {
 	NormalizedPaymentEvent,
 	PaymentProvider,
 	PaymentProviderAddress,
+	PaymentProviderCapabilities,
 	PaymentProviderCredentials,
 	PaymentProviderCustomer,
 	PaymentProviderLineItem,
 	PaymentProviderRuntimeContext,
 	PaymentProviderShippingOption,
+	PaymentStatusResult,
 	RefundResult,
 	VerifyWebhookInput,
 	VerifyWebhookResult,

@@ -286,14 +286,23 @@ export async function createOrderFromPaymentIntent(
 		throw new Error(`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`);
 	}
 
-	const reconcile = reconcilePaymentAmount(cart.total.amount, pi.amount_received);
-	const amountMismatch = !reconcile.ok;
-	if (amountMismatch) {
-		ctx.log.error("Payment amount mismatch — order will be placed on-hold", {
+	const reconcile = reconcilePaymentAmount(
+		cart.total.amount,
+		pi.amount_received,
+		cart.currency,
+		pi.currency,
+	);
+	const integrityHold = !reconcile.ok;
+	if (integrityHold) {
+		ctx.log.error("Payment amount/currency mismatch — order will be placed on-hold", {
 			paymentIntentId: pi.id,
 			expected: reconcile.expected,
 			received: reconcile.received,
 			delta: reconcile.delta,
+			amountOk: reconcile.amountOk,
+			currencyOk: reconcile.currencyOk,
+			expectedCurrency: reconcile.expectedCurrency,
+			receivedCurrency: reconcile.receivedCurrency,
 		});
 	}
 
@@ -349,7 +358,7 @@ export async function createOrderFromPaymentIntent(
 	const order: Order = {
 		id: orderId,
 		orderNumber,
-		status: amountMismatch ? "on-hold" : "processing",
+		status: integrityHold ? "on-hold" : "processing",
 		paymentStatus: "paid",
 		customerId: customer.id,
 		customerEmail: customer.email,
@@ -377,11 +386,14 @@ export async function createOrderFromPaymentIntent(
 		...(cart.notes ? { customerNote: cart.notes } : {}),
 		metadata: {
 			orderDraftId,
-			...(amountMismatch
+			...(integrityHold
 				? {
-						paymentAmountMismatch: true,
+						paymentAmountMismatch: !reconcile.amountOk,
+						paymentCurrencyMismatch: !reconcile.currencyOk,
 						expectedAmount: reconcile.expected,
 						receivedAmount: reconcile.received,
+						expectedCurrency: reconcile.expectedCurrency,
+						receivedCurrency: reconcile.receivedCurrency,
 					}
 				: {}),
 		},
@@ -456,9 +468,9 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	// (8) Digital download grants (no-op when no digital items present).
-	// Withhold grants when amount_received does not match cart total —
-	// operator must review the on-hold order before releasing downloads.
-	if (!amountMismatch) {
+	// Withhold grants when amount_received or currency does not match the
+	// cart — operator must review the on-hold order before releasing downloads.
+	if (!integrityHold) {
 		try {
 			const issued = await issueGrantsForOrder(ctx, order, items);
 			if (issued.length > 0) {
@@ -474,10 +486,14 @@ export async function createOrderFromPaymentIntent(
 			});
 		}
 	} else {
-		ctx.log.warn("Withholding download grants due to payment amount mismatch", {
+		ctx.log.warn("Withholding download grants due to payment amount/currency mismatch", {
 			orderId: order.id,
 			expected: reconcile.expected,
 			received: reconcile.received,
+			amountOk: reconcile.amountOk,
+			currencyOk: reconcile.currencyOk,
+			expectedCurrency: reconcile.expectedCurrency,
+			receivedCurrency: reconcile.receivedCurrency,
 		});
 	}
 

@@ -21,11 +21,7 @@
 import type { PluginContext, StorageCollection } from "emdash";
 import { restoreForOrderItem } from "../inventory/restore";
 import { CurrencyMismatchError, type Money, add } from "../money";
-import {
-	getPaymentProvider,
-	loadPaymentProviderCredentials,
-	stripePaymentProvider,
-} from "../payment-provider";
+import { loadPaymentProviderCredentials, requirePaymentProvider } from "../payment-provider";
 import type { StripeClientOptions } from "../stripe/client";
 import type { StripeRefund } from "../stripe/refunds";
 import type { Order, Refund } from "../types";
@@ -52,8 +48,13 @@ export interface RefundOrderInput {
 	lineItemRefunds?: LineItemRefund[];
 	restock?: boolean;
 	createdByUserId?: string;
-	/** Stripe client creds (read from KV by caller). Optional when KV is configured. */
-	client: StripeClientOptions;
+	/**
+	 * Ignored. Credentials always load from KV via
+	 * `loadPaymentProviderCredentials(order.providerId)` so a Stripe key
+	 * is never handed to a non-Stripe adapter (and a non-Stripe order
+	 * can refund without Stripe configured).
+	 */
+	client?: StripeClientOptions;
 	/**
 	 * Stable refund request id used as the provider idempotency key.
 	 * Must be unique per refund attempt — not derived only from
@@ -163,12 +164,10 @@ async function providerRefundWithDedup(
 	input: RefundOrderInput,
 ): Promise<StripeRefund> {
 	const providerId = order.providerId ?? "stripe";
-	const provider = getPaymentProvider(providerId) ?? stripePaymentProvider;
-	const creds = input.client?.secretKey
-		? { secretKey: input.client.secretKey }
-		: await loadPaymentProviderCredentials(ctx.kv, provider.id);
+	const provider = requirePaymentProvider(providerId);
+	const creds = await loadPaymentProviderCredentials(ctx.kv, providerId);
 	if (!creds) {
-		throw new Error(`Payment provider "${provider.id}" is not configured`);
+		throw new Error(`Payment provider "${providerId}" is not configured`);
 	}
 	const paymentReference = order.paymentReference ?? order.stripePaymentIntentId;
 	if (!paymentReference) {
@@ -185,6 +184,7 @@ async function providerRefundWithDedup(
 			amount: input.amount.amount,
 			currency: input.amount.currency,
 			reason: input.reason,
+			metadata: { orderId: order.id, orderNumber: order.orderNumber },
 		},
 		creds,
 	);

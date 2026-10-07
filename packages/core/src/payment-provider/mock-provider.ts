@@ -9,6 +9,8 @@ import type {
 	InitCheckoutResult,
 	NormalizedPaymentEvent,
 	PaymentProvider,
+	PaymentProviderCapabilities,
+	PaymentStatusResult,
 	RefundResult,
 	VerifyWebhookInput,
 	VerifyWebhookResult,
@@ -21,6 +23,10 @@ export interface MockPaymentProviderOptions {
 	failRefund?: boolean;
 	failVerifyWebhook?: boolean;
 	asyncPendingCheckout?: boolean;
+	capabilities?: PaymentProviderCapabilities;
+	/** When set, `getPaymentStatus` is omitted so callers trust the webhook payload. */
+	omitGetPaymentStatus?: boolean;
+	getPaymentStatusResult?: PaymentStatusResult;
 }
 
 function appendQueryParam(urlString: string, key: string, value: string): string {
@@ -40,6 +46,7 @@ export function createMockPaymentProvider(
 	return {
 		id: providerId,
 		label: `Mock (${providerId})`,
+		...(options.capabilities ? { capabilities: options.capabilities } : {}),
 
 		supportsCurrency(currency: string): boolean {
 			if (!currency || typeof currency !== "string") return false;
@@ -178,5 +185,23 @@ export function createMockPaymentProvider(
 		formatAmount(amount: number, currency: string): string {
 			return format(money(currency, amount));
 		},
+
+		...(options.omitGetPaymentStatus
+			? {}
+			: {
+					async getPaymentStatus(
+						_ctx: unknown,
+						paymentReference: string,
+					): Promise<PaymentStatusResult> {
+						if (options.getPaymentStatusResult) {
+							return {
+								...options.getPaymentStatusResult,
+								paymentReference:
+									options.getPaymentStatusResult.paymentReference ?? paymentReference,
+							};
+						}
+						return { status: "succeeded", paymentReference };
+					},
+				}),
 	};
 }

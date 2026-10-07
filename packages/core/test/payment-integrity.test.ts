@@ -278,6 +278,28 @@ describe("reconcilePaymentAmount", () => {
 		expect(r.ok).toBe(false);
 		expect(r.received).toBe(0);
 	});
+
+	it("holds when amount matches but currency differs (5000 KES vs 5000 USD)", () => {
+		const r = reconcilePaymentAmount(5_000, 5_000, "USD", "KES");
+		expect(r.ok).toBe(false);
+		expect(r.amountOk).toBe(true);
+		expect(r.currencyOk).toBe(false);
+		expect(r.expectedCurrency).toBe("USD");
+		expect(r.receivedCurrency).toBe("KES");
+	});
+
+	it("holds when expected currency is set but received currency is missing", () => {
+		const r = reconcilePaymentAmount(5_000, 5_000, "USD", undefined);
+		expect(r.ok).toBe(false);
+		expect(r.currencyOk).toBe(false);
+	});
+
+	it("passes when amount and currency both match (case-insensitive)", () => {
+		const r = reconcilePaymentAmount(5_000, 5_000, "usd", "USD");
+		expect(r.ok).toBe(true);
+		expect(r.amountOk).toBe(true);
+		expect(r.currencyOk).toBe(true);
+	});
 });
 
 describe("checkout totals integrity composition", () => {

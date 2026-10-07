@@ -22,9 +22,11 @@ import { getCart, save } from "../cart/store";
 import { refreshAppliedCoupons } from "../coupons/refresh";
 import { money, zero } from "../money";
 import {
+	DEFAULT_PAYMENT_PROVIDER_ID,
 	type InitCheckoutInput,
 	loadPaymentProviderCredentials,
 	resolveProvider,
+	unsupportedHostedCheckoutFeatures,
 } from "../payment-provider";
 import { normalizeProductFields } from "../products/normalize";
 import { resolvePrice } from "../products/pricing";
@@ -234,6 +236,19 @@ export const checkoutRoutes = {
 				);
 			}
 
+			const configuredProvider =
+				(await ctx.kv.get<string>("settings:paymentProvider")) ?? DEFAULT_PAYMENT_PROVIDER_ID;
+			const checkoutMode =
+				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
+			if (configuredProvider !== "stripe" && checkoutMode !== "embedded") {
+				return new Response(
+					JSON.stringify({
+						error: `Embedded PaymentIntents are Stripe-only. Use /checkout/create-session for payment provider "${configuredProvider}", or set checkoutMode=embedded to keep Stripe Elements.`,
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
 			// Stamp any newly-provided email/notes onto the cart.
 			const withContact: CartState = {
 				...cart,
@@ -431,6 +446,17 @@ export const checkoutRoutes = {
 			}
 
 			const provider = await resolveProvider(ctx.kv);
+			const checkoutMode =
+				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
+			if (provider.id !== "stripe" && checkoutMode === "embedded") {
+				return new Response(
+					JSON.stringify({
+						error:
+							"Embedded checkout is Stripe-only. Switch checkoutMode to hosted before using another payment provider so in-flight Stripe PaymentIntents can still complete.",
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
 			const creds = await loadPaymentProviderCredentials(ctx.kv, provider.id);
 			if (!creds) {
 				const message =
@@ -539,6 +565,38 @@ export const checkoutRoutes = {
 					JSON.stringify({
 						error:
 							"Subscription and one-time items can't be purchased together. Place them as separate orders.",
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			let transferDataPreview: { destination: string; amount?: number } | undefined;
+			let applicationFeePreview: number | undefined;
+			if (await connectEnabled(ctx)) {
+				try {
+					const plan = await computeSplit(ctx, recalculated);
+					if (plan.mode === "single-vendor") {
+						const g = plan.vendorGroups[0];
+						if (g) {
+							transferDataPreview = { destination: g.stripeAccountId };
+							applicationFeePreview = g.applicationFee.amount;
+						}
+					}
+				} catch {
+					// Split errors are returned later on the Connect path; capability
+					// check only needs to know whether Connect was requested.
+				}
+			}
+			const unsupported = unsupportedHostedCheckoutFeatures(provider, {
+				coupons: recalculated.discountTotal.amount > 0 && !isSubscriptionCart,
+				connect: Boolean(transferDataPreview) || applicationFeePreview !== undefined,
+				subscriptions: isSubscriptionCart,
+			});
+			if (unsupported.length > 0) {
+				return new Response(
+					JSON.stringify({
+						error: `Payment provider "${provider.id}" does not support: ${unsupported.join(", ")}. Remove those cart features or use a provider that declares them.`,
+						unsupported,
 					}),
 					{ status: 409, headers: { "Content-Type": "application/json" } },
 				);

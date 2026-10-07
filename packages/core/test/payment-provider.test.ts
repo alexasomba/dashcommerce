@@ -4,18 +4,25 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type { PluginContext, RouteContext } from "emdash";
+import { money, zero } from "../src/money";
+import { createOrderFromPaymentIntent } from "../src/orders/create";
+import { refundOrder } from "../src/orders/refund";
 import {
 	type InitCheckoutInput,
 	createMockPaymentProvider,
 	registerPaymentProvider,
+	requirePaymentProvider,
 	resetPaymentProviders,
 	resolveProvider,
+	resolveWebhookProvider,
 	stripePaymentProvider,
 	toCreateCheckoutSessionInput,
+	unsupportedHostedCheckoutFeatures,
 	withBillingShippingFallback,
 } from "../src/payment-provider";
 import { webhookRoutes } from "../src/routes/webhook";
 import { encodeStripeForm } from "../src/stripe/client";
+import type { Address, CartState, Order } from "../src/types";
 
 afterEach(() => {
 	resetPaymentProviders();
@@ -175,7 +182,31 @@ describe("checkoutReference vs paymentReference", () => {
 		expect(form.payment_intent).toBe("pi_test_abc");
 		expect(form.payment_intent?.startsWith("cs_")).toBe(false);
 		expect(idempotency).toBe("refund_req_1");
+		expect(form.reason).toBe("requested_by_customer");
 		expect(result.providerRefundId).toBe("re_1");
+	});
+
+	it("posts refund metadata {orderId,orderNumber} and maps unknown reasons to requested_by_customer", async () => {
+		let form: Record<string, string> = {};
+		const ctx = runtimeCtx((_url, init) => {
+			form = parseForm(typeof init?.body === "string" ? init.body : undefined);
+			return { id: "re_meta", amount: 100, currency: "usd", status: "succeeded" };
+		});
+		await stripePaymentProvider.refund(
+			ctx,
+			{
+				paymentReference: "pi_1",
+				refundRequestId: "refund_req_meta",
+				currency: "USD",
+				amount: 100,
+				reason: "customer asked",
+				metadata: { orderId: "ord_1", orderNumber: "1001" },
+			},
+			{ secretKey: "sk_test_x" },
+		);
+		expect(form.reason).toBe("requested_by_customer");
+		expect(form["metadata[orderId]"]).toBe("ord_1");
+		expect(form["metadata[orderNumber]"]).toBe("1001");
 	});
 });
 
@@ -558,7 +589,7 @@ function webhookCtx(opts?: { duplicateEvent?: boolean }) {
 				},
 			},
 		},
-		log: { info() {}, warn() {}, error() {} },
+		log: { info() {}, warn() {}, error() {}, debug() {} },
 		site: { url: "https://shop.example", name: "Shop" },
 		url: (p: string) => `https://shop.example${p}`,
 	} as unknown as PluginContext;
@@ -617,5 +648,330 @@ describe("webhook route wiring", () => {
 		expect(second.status).toBe(200);
 		const body = (await second.json()) as { duplicate?: boolean };
 		expect(body.duplicate).toBe(true);
+	});
+
+	it("still verifies Stripe events after settings:paymentProvider switches away (stripe-signature)", async () => {
+		const secret = "whsec_test";
+		const payload = JSON.stringify({
+			id: "evt_inflight",
+			type: "ping",
+			data: { object: {} },
+		});
+		const timestamp = Math.floor(Date.now() / 1000);
+		const sig = await hmacHex(secret, `${timestamp}.${payload}`);
+		const ctx = webhookCtx();
+		(ctx.kv as { get: (k: string) => Promise<unknown> }).get = async (k: string) => {
+			if (k === "settings:paymentProvider") return "paystack";
+			if (k === "settings:stripeWebhookSecret") return secret;
+			if (k === "settings:stripeSecretKey") return "sk_test_x";
+			return null;
+		};
+		const res = await webhookRoutes["checkout/webhook"].handler(
+			{
+				input: {},
+				request: new Request("http://test/checkout/webhook", {
+					method: "POST",
+					headers: { "stripe-signature": `t=${timestamp},v1=${sig}` },
+					body: payload,
+				}),
+			} as unknown as RouteContext,
+			ctx,
+		);
+		expect(res).toBeInstanceOf(Response);
+		if (!(res instanceof Response)) return;
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { received?: boolean; skipped?: boolean };
+		expect(body.received).toBe(true);
+	});
+});
+
+describe("requirePaymentProvider — no silent Stripe fallback", () => {
+	it("throws when the id is not registered", () => {
+		expect(() => requirePaymentProvider("paystack")).toThrow(/not registered/);
+	});
+
+	it("resolveProvider throws for an unregistered settings value", async () => {
+		const kv = { get: async () => "paystack" };
+		await expect(resolveProvider(kv)).rejects.toThrow(/not registered/);
+	});
+});
+
+describe("resolveWebhookProvider", () => {
+	it("routes stripe-signature to Stripe even when settings say otherwise", async () => {
+		const kv = { get: async () => "paystack" };
+		const headers = new Headers({ "stripe-signature": "t=1,v1=abc" });
+		const { provider, signatureHeader } = await resolveWebhookProvider(kv, headers);
+		expect(provider.id).toBe("stripe");
+		expect(signatureHeader).toBe("t=1,v1=abc");
+	});
+
+	it("routes x-<id>-signature to a registered non-Stripe provider", async () => {
+		registerPaymentProvider(createMockPaymentProvider({ id: "mock" }));
+		const kv = { get: async () => "stripe" };
+		const headers = new Headers({ "x-mock-signature": "sig-mock" });
+		const { provider, signatureHeader } = await resolveWebhookProvider(kv, headers);
+		expect(provider.id).toBe("mock");
+		expect(signatureHeader).toBe("sig-mock");
+	});
+
+	it("honors ?provider= over settings", async () => {
+		registerPaymentProvider(createMockPaymentProvider({ id: "mock" }));
+		const kv = { get: async () => "stripe" };
+		const headers = new Headers({ "x-mock-signature": "sig-q" });
+		const { provider } = await resolveWebhookProvider(
+			kv,
+			headers,
+			"http://test/checkout/webhook?provider=mock",
+		);
+		expect(provider.id).toBe("mock");
+	});
+});
+
+describe("unsupportedHostedCheckoutFeatures", () => {
+	it("Stripe declares coupons, Connect, and subscriptions", () => {
+		expect(
+			unsupportedHostedCheckoutFeatures(stripePaymentProvider, {
+				coupons: true,
+				connect: true,
+				subscriptions: true,
+			}),
+		).toEqual([]);
+	});
+
+	it("rejects coupons/Connect/subs when the adapter does not declare them", () => {
+		const mock = createMockPaymentProvider({ id: "mock" });
+		expect(
+			unsupportedHostedCheckoutFeatures(mock, {
+				coupons: true,
+				connect: true,
+				subscriptions: true,
+			}),
+		).toEqual(["coupons", "connect", "subscriptions"]);
+	});
+
+	it("allows features the adapter opts into", () => {
+		const mock = createMockPaymentProvider({
+			id: "mock",
+			capabilities: { coupons: true },
+		});
+		expect(unsupportedHostedCheckoutFeatures(mock, { coupons: true, connect: true })).toEqual([
+			"connect",
+		]);
+	});
+});
+
+const testAddress: Address = {
+	firstName: "Ada",
+	lastName: "Lovelace",
+	line1: "1 Street",
+	city: "London",
+	region: "LDN",
+	postalCode: "EC1A 1BB",
+	country: "GB",
+};
+
+function baseCart(currency: string, amount: number): CartState {
+	return {
+		sessionId: "sess_1",
+		currency,
+		items: [
+			{
+				lineId: "li_1",
+				productId: "prod_1",
+				title: "Mug",
+				quantity: 1,
+				unitPrice: money(currency, amount),
+				lineSubtotal: money(currency, amount),
+				isDigital: false,
+			},
+		],
+		coupons: [],
+		subtotal: money(currency, amount),
+		discountTotal: zero(currency),
+		shippingTotal: zero(currency),
+		taxTotal: zero(currency),
+		total: money(currency, amount),
+		taxLines: [],
+		customerEmail: "ada@example.com",
+		billingAddress: testAddress,
+		shippingAddress: testAddress,
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+	};
+}
+
+function commerceCtx(opts?: { kv?: Record<string, unknown>; orders?: Map<string, Order> }) {
+	const kv = new Map<string, unknown>(Object.entries(opts?.kv ?? {}));
+	const orders = opts?.orders ?? new Map<string, Order>();
+	const customers = new Map<string, unknown>();
+	const refunds = new Map<string, unknown>();
+	return {
+		kv: {
+			get: async <T>(k: string) => (kv.get(k) as T | undefined) ?? null,
+			set: async (k: string, v: unknown) => {
+				kv.set(k, v);
+			},
+			delete: async (k: string) => {
+				kv.delete(k);
+			},
+		},
+		storage: {
+			orders: {
+				get: async (id: string) => orders.get(id) ?? null,
+				put: async (id: string, data: Order) => {
+					orders.set(id, { ...data, id });
+				},
+				query: async ({ where }: { where?: { stripePaymentIntentId?: string } }) => {
+					if (where?.stripePaymentIntentId) {
+						for (const [id, data] of orders) {
+							if (data.stripePaymentIntentId === where.stripePaymentIntentId) {
+								return { items: [{ id, data }], cursor: null, hasMore: false };
+							}
+						}
+					}
+					return { items: [], cursor: null, hasMore: false };
+				},
+			},
+			order_items: {
+				putMany: async () => {},
+				query: async () => ({ items: [], cursor: null, hasMore: false }),
+			},
+			customers: {
+				query: async () => ({ items: [], cursor: null, hasMore: false }),
+				put: async (id: string, data: unknown) => {
+					customers.set(id, data);
+				},
+			},
+			coupons: {
+				query: async () => ({ items: [], cursor: null, hasMore: false }),
+			},
+			coupon_usage: {
+				put: async () => {},
+				count: async () => 0,
+			},
+			refunds: {
+				put: async (id: string, data: unknown) => {
+					refunds.set(id, data);
+				},
+				query: async () => ({ items: [], cursor: null, hasMore: false }),
+			},
+			download_grants: {
+				query: async () => ({ items: [], cursor: null, hasMore: false }),
+			},
+		},
+		log: { info() {}, warn() {}, error() {}, debug() {} },
+		site: { url: "https://shop.example", name: "Shop" },
+		url: (p: string) => `https://shop.example${p}`,
+		_orders: orders,
+		_refunds: refunds,
+	} as unknown as PluginContext & { _orders: Map<string, Order>; _refunds: Map<string, unknown> };
+}
+
+function paidOrder(overrides: Partial<Order> = {}): Order {
+	const currency = overrides.currency ?? "USD";
+	return {
+		id: "ord_1",
+		orderNumber: "1001",
+		status: "processing",
+		paymentStatus: "paid",
+		customerId: "cus_1",
+		customerEmail: "ada@example.com",
+		currency,
+		billingAddress: testAddress,
+		shippingAddress: testAddress,
+		subtotal: money(currency, 1000),
+		discountTotal: zero(currency),
+		shippingTotal: zero(currency),
+		taxTotal: zero(currency),
+		total: money(currency, 1000),
+		paidTotal: money(currency, 1000),
+		refundedTotal: zero(currency),
+		taxLines: [],
+		couponCodes: [],
+		stripePaymentIntentId: "pi_1",
+		providerId: "stripe",
+		paymentReference: "pi_1",
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+		paidAt: new Date().toISOString(),
+		...overrides,
+	};
+}
+
+describe("refund credentials by order.providerId", () => {
+	it("refunds a mock-provider order from KV creds and ignores a passed Stripe secret", async () => {
+		registerPaymentProvider(createMockPaymentProvider({ id: "mock" }));
+		const order = paidOrder({
+			providerId: "mock",
+			paymentReference: "mock_pay_1",
+			stripePaymentIntentId: "mock_pay_1",
+		});
+		const ctx = commerceCtx({
+			kv: { "settings:mockSecretKey": "mock_sk" },
+			orders: new Map([[order.id, order]]),
+		});
+		const refund = await refundOrder(ctx, {
+			orderId: order.id,
+			amount: money("USD", 400),
+			reason: "requested_by_customer",
+			client: { secretKey: "sk_stripe_must_not_be_used" },
+			idempotencyKey: "refund:ord_1:a",
+		});
+		expect(refund.stripeRefundId).toBe("mock_refund_refund:ord_1:a");
+		expect(refund.status).toBe("succeeded");
+	});
+
+	it("throws when the order's provider is not registered (no Stripe fallback)", async () => {
+		const order = paidOrder({ providerId: "paystack", paymentReference: "ref_1" });
+		const ctx = commerceCtx({
+			kv: { "settings:stripeSecretKey": "sk_test_x" },
+			orders: new Map([[order.id, order]]),
+		});
+		await expect(
+			refundOrder(ctx, {
+				orderId: order.id,
+				amount: money("USD", 400),
+				client: { secretKey: "sk_test_x" },
+				idempotencyKey: "refund:ord_1:b",
+			}),
+		).rejects.toThrow(/not registered/);
+	});
+
+	it("does not use input.client.secretKey — Stripe orders need KV Stripe creds", async () => {
+		const order = paidOrder({ providerId: "stripe" });
+		const ctx = commerceCtx({
+			orders: new Map([[order.id, order]]),
+		});
+		await expect(
+			refundOrder(ctx, {
+				orderId: order.id,
+				amount: money("USD", 400),
+				client: { secretKey: "sk_from_admin" },
+				idempotencyKey: "refund:ord_1:c",
+			}),
+		).rejects.toThrow(/not configured/);
+	});
+});
+
+describe("currency mismatch hold", () => {
+	it("places the order on-hold when 5000 KES is reported against a 5000 USD cart", async () => {
+		const ctx = commerceCtx();
+		const { order } = await createOrderFromPaymentIntent(ctx, {
+			paymentIntent: {
+				id: "pi_fx",
+				amount: 5000,
+				amount_received: 5000,
+				currency: "kes",
+				status: "succeeded",
+				receipt_email: "ada@example.com",
+				metadata: { orderDraftId: "draft_fx", checkoutReference: "cs_fx" },
+			},
+			cartSnapshot: baseCart("USD", 5000),
+			orderDraftId: "draft_fx",
+		});
+		expect(order.status).toBe("on-hold");
+		expect(order.metadata?.paymentCurrencyMismatch).toBe(true);
+		expect(order.metadata?.paymentAmountMismatch).toBe(false);
+		expect(order.checkoutReference).toBe("cs_fx");
 	});
 });

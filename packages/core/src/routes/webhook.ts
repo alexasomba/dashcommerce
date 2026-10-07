@@ -1,6 +1,9 @@
 /**
- * Checkout webhook endpoint — public, signature-verified via the active
- * PaymentProvider (`resolveProvider()`, default `"stripe"`).
+ * Checkout webhook endpoint — public, signature-verified via the
+ * PaymentProvider chosen by `resolveWebhookProvider()` (signature header
+ * / `?provider=` / settings). Default `"stripe"`. Stripe events still
+ * verify after the merchant switches `settings:paymentProvider` as long
+ * as `stripe-signature` is present and Stripe webhook creds remain.
  *
  *   POST /checkout/webhook
  *
@@ -30,10 +33,11 @@ import { createOrderFromPaymentIntent, findOrderByPaymentIntent } from "../order
 import { recordRefundFromWebhook } from "../orders/refund";
 import {
 	type NormalizedPaymentEvent,
+	type PaymentProvider,
 	type PaymentProviderAddress,
 	loadPaymentProviderCredentials,
-	resolveProvider,
-	webhookSignatureHeader,
+	requirePaymentProvider,
+	resolveWebhookProvider,
 } from "../payment-provider";
 import type { StripeCheckoutSession, StripeSessionAddress } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
@@ -463,7 +467,13 @@ async function handleCheckoutSessionCompleted(
 	let duplicate = false;
 	try {
 		({ order, duplicate } = await createOrderFromPaymentIntent(ctx, {
-			paymentIntent: pi,
+			paymentIntent: {
+				...pi,
+				metadata: {
+					...pi.metadata,
+					checkoutReference: session.id,
+				},
+			},
 			cartSnapshot: cart,
 			orderDraftId,
 		}));
@@ -649,12 +659,38 @@ async function handleNormalizedChargeSucceeded(
 		}
 	}
 
+	let amount = event.amount;
+	let currency = event.currency;
+	let paymentReference = event.paymentReference;
+	const provider = requirePaymentProvider(event.providerId);
+	if (provider.getPaymentStatus) {
+		const creds = await loadPaymentProviderCredentials(ctx.kv, provider.id);
+		if (creds) {
+			const live = await provider.getPaymentStatus(ctx, event.paymentReference, creds);
+			if (live.status !== "succeeded") {
+				ctx.log.error("Provider retrieve did not confirm a succeeded payment", {
+					providerId: provider.id,
+					paymentReference: event.paymentReference,
+					status: live.status,
+					reason: live.reason,
+				});
+				return new Response(JSON.stringify({ error: "Payment not succeeded at provider" }), {
+					status: 500,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (typeof live.amount === "number") amount = live.amount;
+			if (live.currency) currency = live.currency;
+			if (live.paymentReference) paymentReference = live.paymentReference;
+		}
+	}
+
 	const { order, duplicate } = await createOrderFromPaymentIntent(ctx, {
 		paymentIntent: {
-			id: event.paymentReference,
-			amount: event.amount,
-			amount_received: event.amount,
-			currency: event.currency.toLowerCase(),
+			id: paymentReference,
+			amount,
+			amount_received: amount,
+			currency: currency.toLowerCase(),
 			status: "succeeded",
 			receipt_email: event.customer.email,
 			metadata: {
@@ -705,8 +741,22 @@ export const webhookRoutes = {
 		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
 			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			const req = routeCtx.request;
-			const provider = await resolveProvider(ctx.kv);
-			const sigHeader = webhookSignatureHeader(req.headers, provider.id);
+			let provider: PaymentProvider;
+			let sigHeader: string | null;
+			try {
+				({ provider, signatureHeader: sigHeader } = await resolveWebhookProvider(
+					ctx.kv,
+					req.headers,
+					req.url,
+				));
+			} catch (err) {
+				return new Response(
+					JSON.stringify({
+						error: err instanceof Error ? err.message : "Unknown payment provider",
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}
 			if (!sigHeader) {
 				const missing =
 					provider.id === "stripe"
