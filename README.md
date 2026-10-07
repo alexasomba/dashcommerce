@@ -23,20 +23,30 @@ Scaffolds a complete storefront with EmDash + DashCommerce, demo products, and S
 
 ## Current Release
 
-**v0.2.1** on npm — peer **EmDash `>=0.37.0 <0.38.0 || >=1.1.0 <2.0.0`**. 0.37.x installs stay valid; current EmDash 1.x installs pass peer checks. Skip `emdash@1.0.0` (wrong codebase on npm) and untested 0.38–0.42.
+**v0.2.2** on npm — peer **EmDash `>=0.37.0 <0.38.0 || >=1.1.0 <2.0.0`**. 0.37.x installs stay valid; current EmDash 1.x installs pass peer checks. Skip `emdash@1.0.0` (wrong codebase on npm) and untested 0.38–0.42 until peers widen.
 
 | Package | Version | EmDash Compatibility |
 |---|---|---|
-| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.1 | EmDash 0.37.x or 1.1+ |
-| `@dashcommerce/create` | 0.2.0 | Scaffolds from the starter (track the core peer) |
+| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.2 | EmDash 0.37.x or 1.1+ |
+| `@dashcommerce/create` | track latest | Scaffolds from `emdashCommerce/starter` |
 
 Stay on **0.1.x** if you need EmDash 0.28.x — that line remains on npm and is not bricked by 0.2.x.
 
 The v1.0 feature roadmap is code-complete. SemVer: `0.x` may include minor breaking changes until **1.0.0** — see [CHANGELOG.md](./CHANGELOG.md).
 
-### Discoverability (next bet)
+### Discoverability
 
-EmDash ships a [plugin registry](https://docs.emdashcms.com/plugins/registry/) (`registry.emdashcms.com`). Listing DashCommerce there — once Atmosphere publisher credentials are ready — is the highest-leverage organic install path after npm.
+EmDash’s default plugin discovery is the [Atmosphere registry](https://docs.emdashcms.com/plugins/registry/) ([plugins.emdashcms.com](https://plugins.emdashcms.com/)). Full `@dashcommerce/core` is a **native** npm plugin (~1.9 MB unpacked) and exceeds the sandboxed registry size cap (256 KB), so listing requires a **thin registry package that links to npm** (same pattern as other native plugins). Tracked in [#33](https://github.com/emdashCommerce/dashcommerce/issues/33). Until then: `npm create @dashcommerce@latest`.
+
+## FAQ
+
+### Is this the same as Urumi’s `dash-commerce`?
+
+No. **DashCommerce (`@dashcommerce/core`)** is a Stripe-native commerce plugin: products, cart, checkout, subscriptions, Connect marketplace, and a 12-page admin inside EmDash.
+
+**Urumi’s `dash-commerce`** focuses on **WooCommerce REST v3 + Store API compatibility** so existing Woo clients can talk to EmDash.
+
+If you want a full store on Astro + EmDash with Stripe, use DashCommerce. If you need drop-in Woo API paths for legacy clients, evaluate Urumi.
 
 ## Why DashCommerce
 
