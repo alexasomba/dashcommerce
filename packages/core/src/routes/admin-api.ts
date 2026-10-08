@@ -245,8 +245,6 @@ async function postOrderRefund(
 	orderId: string,
 	routeCtx: RouteContext,
 ): Promise<Response> {
-	const client = await loadStripeClient(ctx);
-	if (!client) return json({ error: "Stripe not configured" }, 500);
 	const input = (routeCtx.input ?? {}) as {
 		amount?: number;
 		currency?: string;
@@ -272,7 +270,6 @@ async function postOrderRefund(
 						})),
 					}
 				: {}),
-			client,
 			idempotencyKey: `refund:${orderId}:${randomId()}`,
 		});
 		return json({ refund });

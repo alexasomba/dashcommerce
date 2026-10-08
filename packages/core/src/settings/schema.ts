@@ -46,11 +46,7 @@ function asPercent(v: unknown, key: string): Result<number> {
 	return asNumber(v, key, 0, 100);
 }
 
-function asStringWithPrefix(
-	v: unknown,
-	key: string,
-	prefixes: string[],
-): Result<string> {
+function asStringWithPrefix(v: unknown, key: string, prefixes: string[]): Result<string> {
 	if (typeof v !== "string" || v.trim() === "") {
 		return bad(`${key} must be a non-empty string`);
 	}
@@ -80,6 +76,7 @@ export const SETTINGS_KEYS = [
 	"stripePublishableKey",
 	"stripeWebhookSecret",
 	"checkoutMode",
+	"paymentProvider",
 ] as const;
 
 export type SettingsKey = (typeof SETTINGS_KEYS)[number];
@@ -114,10 +111,7 @@ export const DEFAULT_CHECKOUT_MODE: CheckoutMode = "hosted";
  * checks (e.g. defaultCurrency ∈ enabledCurrencies) use `validateSettings`
  * below.
  */
-export function validateSettingsKey(
-	key: string,
-	value: unknown,
-): Result<unknown> {
+export function validateSettingsKey(key: string, value: unknown): Result<unknown> {
 	switch (key as SettingsKey) {
 		case "defaultCurrency": {
 			if (typeof value !== "string") return bad("defaultCurrency must be a string");
@@ -131,9 +125,7 @@ export function validateSettingsKey(
 			if (!Array.isArray(value)) return bad("enabledCurrencies must be an array");
 			const codes = normalizeCurrencyList(value);
 			if (codes.length !== value.length) {
-				return bad(
-					"enabledCurrencies contains duplicates or invalid ISO-4217 codes",
-				);
+				return bad("enabledCurrencies contains duplicates or invalid ISO-4217 codes");
 			}
 			if (codes.length === 0) return bad("enabledCurrencies cannot be empty");
 			return ok(codes);
@@ -171,6 +163,12 @@ export function validateSettingsKey(
 		case "checkoutMode": {
 			if (typeof value !== "string" || !CHECKOUT_MODES.includes(value as CheckoutMode)) {
 				return bad(`checkoutMode must be one of: ${CHECKOUT_MODES.join(", ")}`);
+			}
+			return ok(value);
+		}
+		case "paymentProvider": {
+			if (typeof value !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(value)) {
+				return bad("paymentProvider must be a lowercase id (e.g. stripe, paystack, mock)");
 			}
 			return ok(value);
 		}

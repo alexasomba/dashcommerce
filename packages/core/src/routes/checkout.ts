@@ -16,30 +16,36 @@
  */
 
 import type { PluginContext, RouteContext } from "emdash";
-import { randomId } from "../util/ids";
-import { recalculate, type PricingPolicy } from "../cart/calculate";
-import { getCart, save } from "../cart/store";
+import { type PricingPolicy, recalculate } from "../cart/calculate";
 import { createLock, newLock, sumActiveLocksForProduct } from "../cart/lock";
-import { money, zero } from "../money";
-import { resolvePrice } from "../products/pricing";
-import { getVariant } from "../products/variants";
-import { isVariantOfProduct } from "../products/variant-guard";
+import { getCart, save } from "../cart/store";
 import { refreshAppliedCoupons } from "../coupons/refresh";
-import { requoteShipping } from "../shipping/requote";
-import { createPaymentIntent } from "../stripe/payment-intents";
+import { money, zero } from "../money";
 import {
-	createCheckoutSession,
-	createOneTimeCoupon,
+	DEFAULT_PAYMENT_PROVIDER_ID,
+	type InitCheckoutInput,
+	loadPaymentProviderCredentials,
+	resolveProvider,
+	unsupportedHostedCheckoutFeatures,
+} from "../payment-provider";
+import { normalizeProductFields } from "../products/normalize";
+import { resolvePrice } from "../products/pricing";
+import { isVariantOfProduct } from "../products/variant-guard";
+import { getVariant } from "../products/variants";
+import { type CheckoutMode, DEFAULT_CHECKOUT_MODE } from "../settings/schema";
+import { requoteShipping } from "../shipping/requote";
+import {
 	type CheckoutLineItem,
 	type CheckoutShippingOption,
+	createOneTimeCoupon,
 } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
+import { createPaymentIntent } from "../stripe/payment-intents";
 import type { CartLineItem, CartState, StockLockEntry } from "../types";
-import { normalizeProductFields } from "../products/normalize";
+import { randomId } from "../util/ids";
+import { getPublicSiteUrl } from "../util/site-url";
 import { computeSplit, connectEnabled } from "../vendors/split";
 import { resolveSessionId } from "./cart";
-import { DEFAULT_CHECKOUT_MODE, type CheckoutMode } from "../settings/schema";
-import { getPublicSiteUrl } from "../util/site-url";
 
 const DRAFT_PREFIX = "draft:";
 const DRAFT_TTL_MS = 15 * 60 * 1000;
@@ -75,10 +81,7 @@ interface RepriceResult {
 	stockEntries: StockLockEntry[];
 }
 
-async function repriceAndCheckStock(
-	ctx: PluginContext,
-	cart: CartState,
-): Promise<RepriceResult> {
+async function repriceAndCheckStock(ctx: PluginContext, cart: CartState): Promise<RepriceResult> {
 	const errors: RepriceError[] = [];
 	const out: CartLineItem[] = [];
 	const stockEntries: StockLockEntry[] = [];
@@ -103,9 +106,7 @@ async function repriceAndCheckStock(
 			errors.push({ lineId: line.lineId, productId: line.productId, reason: "unavailable" });
 			continue;
 		}
-		const fields = normalizeProductFields(
-			record.data as Record<string, unknown>,
-		);
+		const fields = normalizeProductFields(record.data as Record<string, unknown>);
 		const variant = line.variantId ? await getVariant(ctx, line.variantId) : null;
 		if (line.variantId) {
 			if (!isVariantOfProduct(variant, record.id)) {
@@ -180,7 +181,6 @@ async function repriceAndCheckStock(
 	return { items: out, errors, stockEntries };
 }
 
-
 function totalsChanged(before: CartState, after: CartState): boolean {
 	return (
 		before.total.amount !== after.total.amount ||
@@ -233,6 +233,19 @@ export const checkoutRoutes = {
 				return new Response(
 					JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
 					{ status: 500, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			const configuredProvider =
+				(await ctx.kv.get<string>("settings:paymentProvider")) ?? DEFAULT_PAYMENT_PROVIDER_ID;
+			const checkoutMode =
+				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
+			if (configuredProvider !== "stripe" && checkoutMode !== "embedded") {
+				return new Response(
+					JSON.stringify({
+						error: `Embedded PaymentIntents are Stripe-only. Use /checkout/create-session for payment provider "${configuredProvider}", or set checkoutMode=embedded to keep Stripe Elements.`,
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
 				);
 			}
 
@@ -316,10 +329,10 @@ export const checkoutRoutes = {
 					if (plan.mode === "single-vendor") {
 						const g = plan.vendorGroups[0];
 						if (!g) {
-							return new Response(
-								JSON.stringify({ error: "Split plan missing vendor group" }),
-								{ status: 500, headers: { "Content-Type": "application/json" } },
-							);
+							return new Response(JSON.stringify({ error: "Split plan missing vendor group" }), {
+								status: 500,
+								headers: { "Content-Type": "application/json" },
+							});
 						}
 						transferData = { destination: g.stripeAccountId };
 						applicationFeeAmount = g.applicationFee.amount;
@@ -336,8 +349,7 @@ export const checkoutRoutes = {
 				} catch (err) {
 					return new Response(
 						JSON.stringify({
-							error:
-								err instanceof Error ? err.message : "Vendor split computation failed",
+							error: err instanceof Error ? err.message : "Vendor split computation failed",
 						}),
 						{ status: 409, headers: { "Content-Type": "application/json" } },
 					);
@@ -409,6 +421,11 @@ export const checkoutRoutes = {
 	 * handler short-circuits when it sees `metadata.checkoutMode ===
 	 * "hosted"` on the PI, letting the session-level flow own order
 	 * creation. See `routes/webhook.ts`.
+	 *
+	 * Hosted session creation goes through `resolveProvider()` so a
+	 * registered non-Stripe adapter can own the redirect. Default
+	 * `"stripe"` maps onto the same Checkout Session fields this route
+	 * has always sent (shipping, tax, subscriptions, Connect).
 	 */
 	"checkout/create-session": {
 		public: true,
@@ -428,13 +445,30 @@ export const checkoutRoutes = {
 				});
 			}
 
-			const client = await loadStripeClient(ctx);
-			if (!client) {
+			const provider = await resolveProvider(ctx.kv);
+			const checkoutMode =
+				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
+			if (provider.id !== "stripe" && checkoutMode === "embedded") {
 				return new Response(
-					JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
-					{ status: 500, headers: { "Content-Type": "application/json" } },
+					JSON.stringify({
+						error:
+							"Embedded checkout is Stripe-only. Switch checkoutMode to hosted before using another payment provider so in-flight Stripe PaymentIntents can still complete.",
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
 				);
 			}
+			const creds = await loadPaymentProviderCredentials(ctx.kv, provider.id);
+			if (!creds) {
+				const message =
+					provider.id === "stripe"
+						? "Stripe not configured (settings:stripeSecretKey)"
+						: `Payment provider "${provider.id}" is not configured`;
+				return new Response(JSON.stringify({ error: message }), {
+					status: 500,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			const client = { secretKey: creds.secretKey };
 
 			// Hosted mode needs a shippingMethod + at least a partial ship-to
 			// address. `cart/shipping-methods` populates the method; the
@@ -452,10 +486,10 @@ export const checkoutRoutes = {
 					);
 				}
 				if (!cart.shippingMethod) {
-					return new Response(
-						JSON.stringify({ error: "Select a shipping method first." }),
-						{ status: 409, headers: { "Content-Type": "application/json" } },
-					);
+					return new Response(JSON.stringify({ error: "Select a shipping method first." }), {
+						status: 409,
+						headers: { "Content-Type": "application/json" },
+					});
 				}
 			}
 
@@ -492,6 +526,14 @@ export const checkoutRoutes = {
 					headers: { "Content-Type": "application/json" },
 				});
 			}
+			if (!provider.supportsCurrency(recalculated.currency)) {
+				return new Response(
+					JSON.stringify({
+						error: `Currency "${recalculated.currency}" is not supported by payment provider "${provider.id}".`,
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}
 			await save(ctx, recalculated);
 
 			const orderDraftId = randomId();
@@ -523,6 +565,38 @@ export const checkoutRoutes = {
 					JSON.stringify({
 						error:
 							"Subscription and one-time items can't be purchased together. Place them as separate orders.",
+					}),
+					{ status: 409, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			let transferDataPreview: { destination: string; amount?: number } | undefined;
+			let applicationFeePreview: number | undefined;
+			if (await connectEnabled(ctx)) {
+				try {
+					const plan = await computeSplit(ctx, recalculated);
+					if (plan.mode === "single-vendor") {
+						const g = plan.vendorGroups[0];
+						if (g) {
+							transferDataPreview = { destination: g.stripeAccountId };
+							applicationFeePreview = g.applicationFee.amount;
+						}
+					}
+				} catch {
+					// Split errors are returned later on the Connect path; capability
+					// check only needs to know whether Connect was requested.
+				}
+			}
+			const unsupported = unsupportedHostedCheckoutFeatures(provider, {
+				coupons: recalculated.discountTotal.amount > 0 && !isSubscriptionCart,
+				connect: Boolean(transferDataPreview) || applicationFeePreview !== undefined,
+				subscriptions: isSubscriptionCart,
+			});
+			if (unsupported.length > 0) {
+				return new Response(
+					JSON.stringify({
+						error: `Payment provider "${provider.id}" does not support: ${unsupported.join(", ")}. Remove those cart features or use a provider that declares them.`,
+						unsupported,
 					}),
 					{ status: 409, headers: { "Content-Type": "application/json" } },
 				);
@@ -563,8 +637,10 @@ export const checkoutRoutes = {
 
 			if (!stripeTaxEnabled && recalculated.taxTotal.amount > 0) {
 				const taxLabel =
-					recalculated.taxLines.map((l) => l.label).filter(Boolean).join(", ") ||
-					"Tax";
+					recalculated.taxLines
+						.map((l) => l.label)
+						.filter(Boolean)
+						.join(", ") || "Tax";
 				lineItems.push({
 					amount: recalculated.taxTotal.amount,
 					currency: recalculated.currency.toLowerCase(),
@@ -585,15 +661,15 @@ export const checkoutRoutes = {
 					]
 				: [];
 
-		// Use getPublicSiteUrl() to ensure we never use localhost or stale
-		// database options (emdash:site_url) for Stripe redirect URLs.
-		// Production deployments must set SITE_URL environment variable.
-		const siteUrl = getPublicSiteUrl(ctx);
+			// Use getPublicSiteUrl() to ensure we never use localhost or stale
+			// database options (emdash:site_url) for Stripe redirect URLs.
+			// Production deployments must set SITE_URL environment variable.
+			const siteUrl = getPublicSiteUrl(ctx);
 
-		// Pass `{CHECKOUT_SESSION_ID}` literally — Stripe substitutes
-		// it server-side on redirect.
-		const successUrl = `${siteUrl}/thank-you/${encodeURIComponent(orderDraftId)}?session_id={CHECKOUT_SESSION_ID}`;
-		const cancelUrl = `${siteUrl}/checkout?canceled=1`;
+			// Pass `{CHECKOUT_SESSION_ID}` literally — Stripe substitutes
+			// it server-side on redirect.
+			const successUrl = `${siteUrl}/thank-you/${encodeURIComponent(orderDraftId)}?session_id={CHECKOUT_SESSION_ID}`;
+			const cancelUrl = `${siteUrl}/checkout?canceled=1`;
 
 			// Vendor split (Connect). Reuses the single-vendor path from
 			// create-intent. Multi-vendor carts are rejected the same way.
@@ -605,10 +681,10 @@ export const checkoutRoutes = {
 					if (plan.mode === "single-vendor") {
 						const g = plan.vendorGroups[0];
 						if (!g) {
-							return new Response(
-								JSON.stringify({ error: "Split plan missing vendor group" }),
-								{ status: 500, headers: { "Content-Type": "application/json" } },
-							);
+							return new Response(JSON.stringify({ error: "Split plan missing vendor group" }), {
+								status: 500,
+								headers: { "Content-Type": "application/json" },
+							});
 						}
 						transferData = { destination: g.stripeAccountId };
 						applicationFeeAmount = g.applicationFee.amount;
@@ -667,9 +743,12 @@ export const checkoutRoutes = {
 				: undefined;
 
 			let stripeDiscountCouponId: string | undefined;
-			if (recalculated.discountTotal.amount > 0 && !isSubscriptionCart) {
-				const couponName =
-					recalculated.coupons.map((c) => c.code).join("+") || "Cart discount";
+			if (
+				provider.id === "stripe" &&
+				recalculated.discountTotal.amount > 0 &&
+				!isSubscriptionCart
+			) {
+				const couponName = recalculated.coupons.map((c) => c.code).join("+") || "Cart discount";
 				const stripeCoupon = await createOneTimeCoupon(
 					ctx,
 					{
@@ -683,76 +762,92 @@ export const checkoutRoutes = {
 				stripeDiscountCouponId = stripeCoupon.id;
 			}
 
-			const session = await createCheckoutSession(
-				ctx,
-				{
-					mode: isSubscriptionCart ? "subscription" : "payment",
-					successUrl,
-					cancelUrl,
-					lineItems,
-					...(stripeDiscountCouponId
-						? { discounts: [{ coupon: stripeDiscountCouponId }] }
-						: {}),
-					...(recalculated.customerEmail
-						? { customerEmail: recalculated.customerEmail }
-						: {}),
-					...(hasPhysical && recalculated.shippingAddress
-						? {
-								shippingAddressCollection: {
-									allowedCountries: [recalculated.shippingAddress.country],
-								},
-							}
-						: {}),
-					...(shippingOptions.length > 0 ? { shippingOptions } : {}),
-					billingAddressCollection: "auto",
-					allowPromotionCodes: false,
-					clientReferenceId: orderDraftId,
-					metadata,
-					// Stripe Tax — the merchant toggled "stripe_tax" as the
-					// cart's tax mode. Stripe Checkout then looks up the
-					// buyer's jurisdiction from the billing/shipping address
-					// and recomputes tax server-side on the hosted page.
-					...(stripeTaxEnabled ? { automaticTax: true } : {}),
-					...(subscriptionMetadata ? { subscriptionMetadata } : {}),
-					...(subscriptionTrialPeriodDays > 0
-						? { subscriptionTrialPeriodDays }
-						: {}),
-					// One-time-payment-only fields. `createCheckoutSession`
-					// also gates these on `mode === "payment"`, but we
-					// skip the whole block for subscription carts to keep
-					// the intent obvious.
-					...(!isSubscriptionCart
-						? {
-								paymentIntentMetadata: {
-									orderDraftId,
-									sessionId,
-									checkoutMode: "hosted",
-								},
-								...(recalculated.customerEmail
-									? { paymentIntentReceiptEmail: recalculated.customerEmail }
-									: {}),
-								...(transferData ? { paymentIntentTransferData: transferData } : {}),
-								...(applicationFeeAmount !== undefined
-									? { paymentIntentApplicationFeeAmount: applicationFeeAmount }
-									: {}),
-							}
-						: {}),
+			const initCheckout: InitCheckoutInput = {
+				orderDraftId,
+				amount: recalculated.total.amount,
+				currency: recalculated.currency,
+				customer: {
+					email: recalculated.customerEmail ?? "",
 				},
-				client,
-				`cs:${orderDraftId}`,
-			);
+				lineItems: lineItems.map((li) => ({
+					name: li.name,
+					amount: li.amount,
+					currency: li.currency,
+					quantity: li.quantity,
+					...(li.metadata ? { metadata: li.metadata } : {}),
+					...(li.recurring ? { recurring: li.recurring } : {}),
+					...(li.taxBehavior ? { taxBehavior: li.taxBehavior } : {}),
+				})),
+				successUrl,
+				cancelUrl,
+				mode: isSubscriptionCart ? "subscription" : "payment",
+				billingAddressCollection: "auto",
+				allowPromotionCodes: false,
+				clientReferenceId: orderDraftId,
+				metadata,
+				...(hasPhysical && recalculated.shippingAddress
+					? {
+							shippingAddressCollection: {
+								allowedCountries: [recalculated.shippingAddress.country],
+							},
+						}
+					: {}),
+				...(shippingOptions.length > 0
+					? {
+							shippingOptions: shippingOptions.map((s) => ({
+								id: s.metadata?.shippingMethodId,
+								label: s.displayName,
+								amount: s.amount,
+								currency: s.currency,
+								...(s.metadata ? { metadata: s.metadata } : {}),
+							})),
+						}
+					: {}),
+				...(stripeTaxEnabled ? { automaticTax: true } : {}),
+				...(subscriptionMetadata ? { subscriptionMetadata } : {}),
+				...(subscriptionTrialPeriodDays > 0 ? { subscriptionTrialPeriodDays } : {}),
+				...(stripeDiscountCouponId ? { discounts: [{ coupon: stripeDiscountCouponId }] } : {}),
+				...(!isSubscriptionCart
+					? {
+							paymentIntentMetadata: {
+								orderDraftId,
+								sessionId,
+								checkoutMode: "hosted",
+							},
+							...(recalculated.customerEmail
+								? { paymentIntentReceiptEmail: recalculated.customerEmail }
+								: {}),
+							...(transferData ? { transferData } : {}),
+							...(applicationFeeAmount !== undefined ? { applicationFeeAmount } : {}),
+						}
+					: {}),
+			};
 
-			if (!session.url) {
+			const checkoutResult = await provider.initCheckout(ctx, initCheckout, creds);
+			if (checkoutResult.kind !== "redirect" || !checkoutResult.redirectUrl) {
 				return new Response(
-					JSON.stringify({ error: "Stripe did not return a hosted URL" }),
+					JSON.stringify({
+						error:
+							provider.id === "stripe"
+								? "Stripe did not return a hosted URL"
+								: `Payment provider "${provider.id}" did not return a hosted URL`,
+					}),
 					{ status: 502, headers: { "Content-Type": "application/json" } },
 				);
 			}
 
+			await ctx.kv.set(`${DRAFT_PREFIX}${orderDraftId}`, {
+				cart: recalculated,
+				ttlMs: DRAFT_TTL_MS,
+				createdAt: new Date().toISOString(),
+				providerId: provider.id,
+				checkoutReference: checkoutResult.checkoutReference,
+			});
+
 			return new Response(
 				JSON.stringify({
-					url: session.url,
-					sessionId: session.id,
+					url: checkoutResult.redirectUrl,
+					sessionId: checkoutResult.checkoutReference,
 					orderDraftId,
 					total: recalculated.total,
 					currency: recalculated.currency,
@@ -786,6 +881,8 @@ export type CheckoutDraftSnapshot = {
 	cart: CartState;
 	ttlMs: number;
 	createdAt: string;
+	providerId?: string;
+	checkoutReference?: string;
 };
 
 export function draftKey(orderDraftId: string): string {

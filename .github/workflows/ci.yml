@@ -39,7 +39,6 @@ jobs:
 
       - name: Test
         run: bun run test
-        continue-on-error: true
   
   compatibility-matrix:
     name: EmDash Compatibility (${{ matrix.emdash-version }})

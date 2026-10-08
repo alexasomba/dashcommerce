@@ -43,12 +43,7 @@ export interface Address {
 // Product (host content collection rows)
 // ────────────────────────────────────────────────────────────────────────────
 
-export type ProductType =
-	| "simple"
-	| "variable"
-	| "grouped"
-	| "external"
-	| "subscription";
+export type ProductType = "simple" | "variable" | "grouped" | "external" | "subscription";
 
 export type StockStatus = "instock" | "outofstock" | "onbackorder";
 export type BackorderPolicy = "no" | "yes" | "notify";
@@ -197,12 +192,7 @@ export type OrderStatus =
 	| "partially-refunded"
 	| "failed";
 
-export type PaymentStatus =
-	| "pending"
-	| "paid"
-	| "failed"
-	| "refunded"
-	| "partially-refunded";
+export type PaymentStatus = "pending" | "paid" | "failed" | "refunded" | "partially-refunded";
 
 export interface VendorSplit {
 	vendorId: string;
@@ -236,7 +226,19 @@ export interface Order {
 	couponCodes: string[];
 	vendorSplits?: VendorSplit[];
 	subscriptionIds?: string[];
-	stripePaymentIntentId: string; // unique
+	stripePaymentIntentId: string; // unique — Stripe PaymentIntent id
+	/**
+	 * Gateway that captured this payment. Unset means Stripe, matching
+	 * existing rows written before PaymentProvider existed.
+	 */
+	providerId?: string;
+	/**
+	 * Captured payment id used for refunds. Unset means
+	 * `stripePaymentIntentId` (never a Checkout Session id).
+	 */
+	paymentReference?: string;
+	/** Hosted checkout session / access-code reference, when applicable. */
+	checkoutReference?: string;
 	stripeCustomerId?: string;
 	stripeChargeId?: string;
 	paymentMethodType?: string; // card, link, applepay, …
@@ -277,6 +279,8 @@ export interface Refund {
 	reason?: string;
 	status: "pending" | "succeeded" | "failed";
 	stripeRefundId: string; // unique
+	/** Caller-supplied refund attempt id used as the provider idempotency key. */
+	refundRequestId?: string;
 	lineItemRefunds?: Array<{
 		orderItemId: string;
 		quantity: number;
@@ -381,11 +385,7 @@ export interface ShippingZone {
 	updatedAt: IsoDateTime;
 }
 
-export type ShippingMethodType =
-	| "flat_rate"
-	| "free_shipping"
-	| "local_pickup"
-	| "weight_based";
+export type ShippingMethodType = "flat_rate" | "free_shipping" | "local_pickup" | "weight_based";
 
 export type ShippingMethodConfig =
 	| {

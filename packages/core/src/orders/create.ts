@@ -20,26 +20,26 @@
  */
 
 import type { PluginContext, StorageCollection } from "emdash";
-import { randomId } from "../util/ids";
-import { isUniqueViolation } from "../util/storage";
 import { releaseLock } from "../cart/lock";
+import { issueGrantsForOrder } from "../downloads/grant";
+import { decrementForOrderItem } from "../inventory/decrement";
+import { money, zero } from "../money";
+import type { StripePaymentIntent } from "../stripe/payment-intents";
 import type {
 	CartState,
 	Coupon,
 	CouponUsage,
-	Customer,
 	CurrencyCode,
+	Customer,
 	Order,
 	OrderItem,
 	Refund,
 } from "../types";
-import { money, zero } from "../money";
-import { decrementForOrderItem } from "../inventory/decrement";
-import { issueGrantsForOrder } from "../downloads/grant";
+import { randomId } from "../util/ids";
+import { isUniqueViolation } from "../util/storage";
+import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
 import { sendOrderReceipt } from "./receipt";
 import { reconcilePaymentAmount } from "./reconcile";
-import { orderItemFromStorage, orderItemToStorage } from "./order-item-storage";
-import type { StripePaymentIntent } from "../stripe/payment-intents";
 
 type OrdersStore = StorageCollection<Order>;
 type OrderItemsStore = StorageCollection<OrderItem>;
@@ -98,10 +98,7 @@ async function nextOrderNumber(ctx: PluginContext): Promise<string> {
  * unique-index conflict. Max 8 retries is plenty — conflict storms
  * converge within log-n rounds.
  */
-async function putOrderWithUniqueNumber(
-	ctx: PluginContext,
-	order: Order,
-): Promise<Order> {
+async function putOrderWithUniqueNumber(ctx: PluginContext, order: Order): Promise<Order> {
 	let candidate = order;
 	const MAX_RETRIES = 8;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
@@ -170,8 +167,7 @@ async function upsertCustomer(
 			ordersCount: prev.ordersCount + 1,
 			totalSpent: {
 				...prev.totalSpent,
-				[input.currency]:
-					(prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
+				[input.currency]: (prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
 			},
 			updatedAt: now,
 		};
@@ -287,26 +283,31 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	if (pi.status !== "succeeded") {
-		throw new Error(
-			`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`,
-		);
+		throw new Error(`PaymentIntent ${pi.id} status is "${pi.status}"; expected "succeeded".`);
 	}
 
-	const reconcile = reconcilePaymentAmount(cart.total.amount, pi.amount_received);
-	const amountMismatch = !reconcile.ok;
-	if (amountMismatch) {
-		ctx.log.error("Payment amount mismatch — order will be placed on-hold", {
+	const reconcile = reconcilePaymentAmount(
+		cart.total.amount,
+		pi.amount_received,
+		cart.currency,
+		pi.currency,
+	);
+	const integrityHold = !reconcile.ok;
+	if (integrityHold) {
+		ctx.log.error("Payment amount/currency mismatch — order will be placed on-hold", {
 			paymentIntentId: pi.id,
 			expected: reconcile.expected,
 			received: reconcile.received,
 			delta: reconcile.delta,
+			amountOk: reconcile.amountOk,
+			currencyOk: reconcile.currencyOk,
+			expectedCurrency: reconcile.expectedCurrency,
+			receivedCurrency: reconcile.receivedCurrency,
 		});
 	}
 
 	if (!cart.billingAddress || !cart.shippingAddress) {
-		throw new Error(
-			"Cart snapshot is missing billing or shipping address — cannot create order.",
-		);
+		throw new Error("Cart snapshot is missing billing or shipping address — cannot create order.");
 	}
 
 	const customerEmail = cart.customerEmail ?? pi.receipt_email ?? cart.billingAddress.firstName;
@@ -347,20 +348,17 @@ export async function createOrderFromPaymentIntent(
 			total: line.lineSubtotal,
 			isDigital: line.isDigital,
 			...(line.vendorId ? { vendorId: line.vendorId } : {}),
-			...(line.subscriptionConfig
-				? { subscriptionConfig: line.subscriptionConfig }
-				: {}),
+			...(line.subscriptionConfig ? { subscriptionConfig: line.subscriptionConfig } : {}),
 		};
 		return lineItem;
 	});
 
-	const paidMinor =
-		typeof pi.amount_received === "number" ? pi.amount_received : cart.total.amount;
+	const paidMinor = typeof pi.amount_received === "number" ? pi.amount_received : cart.total.amount;
 
 	const order: Order = {
 		id: orderId,
 		orderNumber,
-		status: amountMismatch ? "on-hold" : "processing",
+		status: integrityHold ? "on-hold" : "processing",
 		paymentStatus: "paid",
 		customerId: customer.id,
 		customerEmail: customer.email,
@@ -379,17 +377,23 @@ export async function createOrderFromPaymentIntent(
 		taxLines: cart.taxLines,
 		couponCodes: cart.coupons.map((c) => c.code),
 		stripePaymentIntentId: pi.id,
+		providerId: pi.metadata?.providerId ?? "stripe",
+		paymentReference: pi.id,
+		...(pi.metadata?.checkoutReference ? { checkoutReference: pi.metadata.checkoutReference } : {}),
 		...(pi.customer ? { stripeCustomerId: pi.customer } : {}),
 		...(pi.latest_charge ? { stripeChargeId: pi.latest_charge } : {}),
 		paymentMethodType: pi.payment_method_types?.[0],
 		...(cart.notes ? { customerNote: cart.notes } : {}),
 		metadata: {
 			orderDraftId,
-			...(amountMismatch
+			...(integrityHold
 				? {
-						paymentAmountMismatch: true,
+						paymentAmountMismatch: !reconcile.amountOk,
+						paymentCurrencyMismatch: !reconcile.currencyOk,
 						expectedAmount: reconcile.expected,
 						receivedAmount: reconcile.received,
+						expectedCurrency: reconcile.expectedCurrency,
+						receivedCurrency: reconcile.receivedCurrency,
 					}
 				: {}),
 		},
@@ -464,9 +468,9 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	// (8) Digital download grants (no-op when no digital items present).
-	// Withhold grants when amount_received does not match cart total —
-	// operator must review the on-hold order before releasing downloads.
-	if (!amountMismatch) {
+	// Withhold grants when amount_received or currency does not match the
+	// cart — operator must review the on-hold order before releasing downloads.
+	if (!integrityHold) {
 		try {
 			const issued = await issueGrantsForOrder(ctx, order, items);
 			if (issued.length > 0) {
@@ -482,10 +486,14 @@ export async function createOrderFromPaymentIntent(
 			});
 		}
 	} else {
-		ctx.log.warn("Withholding download grants due to payment amount mismatch", {
+		ctx.log.warn("Withholding download grants due to payment amount/currency mismatch", {
 			orderId: order.id,
 			expected: reconcile.expected,
 			received: reconcile.received,
+			amountOk: reconcile.amountOk,
+			currencyOk: reconcile.currencyOk,
+			expectedCurrency: reconcile.expectedCurrency,
+			receivedCurrency: reconcile.receivedCurrency,
 		});
 	}
 
@@ -501,14 +509,9 @@ export async function loadOrder(ctx: PluginContext, orderId: string): Promise<Or
 	return { ...(raw as Order), id: orderId };
 }
 
-export async function loadOrderItems(
-	ctx: PluginContext,
-	orderId: string,
-): Promise<OrderItem[]> {
+export async function loadOrderItems(ctx: PluginContext, orderId: string): Promise<OrderItem[]> {
 	const result = await orderItemsStore(ctx).query({ where: { orderId }, limit: 200 });
-	return result.items.map((r) =>
-		orderItemFromStorage(r.id, r.data as OrderItem),
-	);
+	return result.items.map((r) => orderItemFromStorage(r.id, r.data as OrderItem));
 }
 
 export { findOrderByPaymentIntent };
