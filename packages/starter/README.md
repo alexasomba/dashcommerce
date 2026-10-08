@@ -1,6 +1,6 @@
 # @dashcommerce/starter
 
-**v0.2.0** — a ready-to-run Astro commerce site built on [EmDash CMS](https://github.com/emdash-cms/emdash) 0.5 and **`@dashcommerce/core@0.1.3`**. Every feature category the core plugin ships is exercised by a real page.
+**v0.2.0** — a ready-to-run Astro commerce site built on [EmDash CMS](https://github.com/emdash-cms/emdash) 0.5 and **`@dashcommerce/core@0.2.2`**. Every feature category the core plugin ships is exercised by a real page.
 
 **Live demo:** [demo.dashcommerce.dev](https://demo.dashcommerce.dev) · **Templates:** [dashcommerce.dev/templates](https://dashcommerce.dev/templates)
 
